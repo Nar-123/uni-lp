@@ -5863,6 +5863,20 @@ function formatMultiReport(run: MultiStrategyRun, config: MultiConfig): string {
     `chain=${CHAINS[run.chainId].name} · interval=6h · minMC=$${config.minMarketCapUsd.toLocaleString()} · ` +
     `minAge=${config.minTokenAgeHours}h · topN=${config.topN} · usdg=${config.usdgAddress}`;
 
+  // A candidate-source failure (gmgn-cli not found/timed out/exec failed) is
+  // never allowed to look identical to "0 candidates today" — surfaced
+  // distinctly so an operator can tell a broken integration from a quiet
+  // market.
+  if (run.sourceError) {
+    return (
+      `${header}\n\n` +
+      `⚠️ CANDIDATE SOURCE FAILED (${run.sourceError.code})\n` +
+      `${run.sourceError.message.slice(0, 300)}\n\n` +
+      `This is NOT "no candidates today" — the GMGN source itself could not be reached. ` +
+      `No filtering/ranking was performed this run.`
+    );
+  }
+
   const passedLines = run.intents.length
     ? run.intents
         .map((intent) =>

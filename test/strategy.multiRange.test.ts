@@ -105,6 +105,18 @@ test('invalid widthPercent (<=0) fails closed', () => {
   assert.equal(result.valid, false);
 });
 
+test('invalid tickSpacing (0, negative, or NaN — malformed pool state) fails closed, never a NaN/Infinity tick silently accepted', () => {
+  for (const badSpacing of [0, -60, NaN]) {
+    const result = computeMultiRange({
+      currentTick: 0,
+      tickSpacing: badSpacing,
+      widthPercent: 50,
+      usdgIsToken0: true,
+    });
+    assert.equal(result.valid, false, `tickSpacing=${badSpacing} must fail closed`);
+  }
+});
+
 test('near max-tick boundary overflow fails closed rather than producing an out-of-range tick', () => {
   const result = computeMultiRange({
     currentTick: 887_270, // just below TickMath.MAX_TICK

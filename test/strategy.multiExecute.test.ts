@@ -309,6 +309,129 @@ test('executeTradeIntent: NOT_USDG risk-gate failure skips execution without inv
   assert.ok('skipped' in outcome && outcome.skipped);
 });
 
+test('executeTradeIntent: a mintFn failure (quote/simulation/gas failure inside the execution engine) is caught and reported as SIMULATION_FAILED, never thrown or partially recorded', async () => {
+  resetDb();
+  __resetMultiCooldownForTests();
+  const cfg = baseConfig();
+  const token = freshToken();
+  const intent = baseIntent(token);
+
+  let mintCalls = 0;
+  const outcome = await executeTradeIntent({
+    intent: intent as never,
+    candidate: baseCandidate(token) as never,
+    config: cfg as never,
+    prefs: { sizeMode: 'fixed', fixedAmountHuman: 10, balancePercent: 0 } as never,
+    mintFn: async () => {
+      mintCalls++;
+      throw new Error('quote unavailable / simulation reverted / gas estimation failed');
+    },
+  });
+
+  assert.equal(mintCalls, 1, 'mintFn should have been reached (risk gate passed) before it fails');
+  assert.ok('skipped' in outcome && outcome.skipped);
+  if ('skipped' in outcome) assert.equal(outcome.reason, 'SIMULATION_FAILED');
+
+  // No open position, no ledger entry, no accounting metadata must exist for a mint that never happened.
+  const { listOpenPositions, getMultiPositionMeta } = await import('../src/db/index.js');
+  assert.equal(listOpenPositions(CHAIN).length, 0);
+  assert.equal(getMultiPositionMeta(CHAIN, token), undefined);
+});
+
+test('runRiskGate exposure limit: MULTI_MAX_EXPOSURE_USD blocks a new entry once recorded multi-position exposure meets the cap', async () => {
+  resetDb();
+  __resetMultiCooldownForTests();
+  const { recordOpenPosition, recordMultiPositionMeta } = await import('../src/db/index.js');
+  const { checkPositionLimits } = await import('../src/strategy/multiRisk.js');
+  const existingToken = freshToken();
+
+  recordOpenPosition({
+    chainId: CHAIN,
+    tokenId: 'pos-exposure-1',
+    poolAddress: '0xpool',
+    token0: USDG,
+    token1: existingToken,
+    fee: 50_000,
+    tickLower: 0,
+    tickUpper: 100,
+    strategy: 'multi',
+  });
+  recordMultiPositionMeta({
+    chainId: CHAIN,
+    tokenId: 'pos-exposure-1',
+    candidateSource: 'gmgn_trending_6h',
+    candidateInterval: '6h',
+    candidateMarketCapUsd: 2_000_000,
+    candidateAgeHours: 48,
+    candidateVolume6hUsd: 500_000,
+    candidateClassification: 'MEME',
+    candidateScore: 1,
+    poolAddress: '0xpool',
+    poolFee: 50_000,
+    poolTvlUsd: 100_000,
+    poolVolumeUsd: 50_000,
+    poolScore: 0.5,
+    entryPrice: null,
+    tickLower: 0,
+    tickUpper: 100,
+    positionSizeUsd: 500, // already at the default maxExposureUsd cap
+    timestamp: Date.now(),
+  });
+
+  const cfg = baseConfig({ maxOpenPositions: 5, maxPositionsPerToken: 5, maxExposureUsd: 500 });
+  const result = checkPositionLimits(cfg as never, CHAIN, freshToken());
+  assert.equal(result.pass, false);
+  assert.equal(result.reason, 'POSITION_LIMIT');
+});
+
+test('runMultiStrategy: a candidate with no eligible pool is rejected NO_VALID_POOL and produces no intent/execution', async () => {
+  resetDb();
+  __resetMultiCooldownForTests();
+  const cfg = baseConfig();
+  const token = freshToken();
+
+  const run = await runMultiStrategy(cfg as never, {
+    dryRun: true,
+    fetcher: async () => [
+      {
+        address: token,
+        symbol: 'TOK',
+        name: 'Token',
+        price: 1,
+        volume: 500_000,
+        liquidity: 200_000,
+        market_cap: 2_000_000,
+        holder_count: 1000,
+        renowned_count: 0,
+        gas_fee: 0,
+        launchpad_platform: 'pump.fun',
+      },
+    ],
+    infoFetcher: async () => ({
+      address: token,
+      symbol: 'TOK',
+      name: 'Token',
+      decimals: 18,
+      holder_count: 1000,
+      total_supply: '0',
+      circulating_supply: '0',
+      liquidity: '0',
+      total_fee: '0',
+      trade_fee: '0',
+      biggest_pool_address: '0x0',
+      creation_timestamp: Math.floor((Date.now() - 48 * 3_600_000) / 1000),
+      open_timestamp: Math.floor((Date.now() - 48 * 3_600_000) / 1000),
+      launchpad: 'pump.fun',
+      price: { price: '1', price_1h: '0', price_24h: '0', buys_24h: 0, sells_24h: 0, swaps_24h: 0, volume_1h: '0', volume_24h: '0' },
+    }),
+    poolFetcher: async () => [], // no pools discovered for this candidate at all
+  });
+
+  assert.equal(run.intents.length, 0);
+  assert.equal(run.executed.length, 0);
+  assert.ok(run.rejected.some((r) => r.address === token && r.rejectedReason === 'NO_VALID_POOL'));
+});
+
 test('live run: an unresolved pending transaction blocks the entire strategy run before fetching any candidates', async () => {
   resetDb();
   __resetMultiCooldownForTests();

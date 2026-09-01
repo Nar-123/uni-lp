@@ -252,7 +252,7 @@ export async function runMultiStrategy(
     }
   }
 
-  const { candidates, rejected } = await fetchAndFilterCandidates(config, {
+  const { candidates, rejected, sourceError } = await fetchAndFilterCandidates(config, {
     fetcher: opts?.fetcher,
     infoFetcher: opts?.infoFetcher,
     now,
@@ -339,5 +339,5 @@ export async function runMultiStrategy(
     }
   }
 
-  return { chainId: config.chainId, dryRun, timestamp: now, candidates, rejected, intents, executed };
+  return { chainId: config.chainId, dryRun, timestamp: now, candidates, rejected, intents, executed, sourceError };
 }

@@ -111,4 +111,10 @@ export type MultiStrategyRun = {
   rejected: RejectedCandidate[];
   intents: TradeIntent[];
   executed: { tokenId: string; txHash: string; intent: TradeIntent }[];
+  /**
+   * Set when the candidate source itself failed (gmgn-cli not found, exec
+   * failed, timed out, ...) — distinct from a genuinely empty `candidates`
+   * list, which means the source responded and found nothing today.
+   */
+  sourceError?: { code: string; message: string };
 };

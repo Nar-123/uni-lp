@@ -1,6 +1,7 @@
 import type { Address } from 'viem';
 import type { SupportedChainId } from '../config.js';
 import {
+  GmgnError,
   gmgnMarketTrending,
   gmgnTokenInfo,
   type GmgnMarketTrendingParams,
@@ -95,10 +96,21 @@ function compareCandidates(a: MultiCandidate, b: MultiCandidate): number {
  * → top N. UNKNOWN data always fails closed with an explicit reason code —
  * never coerced to 0, never allowed to pass silently.
  */
+/**
+ * A candidate-source failure (gmgn-cli not found, exec failed, timed out,
+ * non-zero exit, malformed/empty output, ...) MUST be distinguishable from
+ * "the source responded and genuinely returned nothing today" — collapsing
+ * both into an empty candidate list would let an operator mistake a broken
+ * integration for a quiet market. `code` is a GmgnErrorCode when the
+ * failure came from gmgn-cli; otherwise a generic fallback for a custom
+ * fetcher's own error.
+ */
+export type CandidateSourceError = { code: string; message: string };
+
 export async function fetchAndFilterCandidates(
   config: MultiConfig,
   opts?: { fetcher?: CandidateFetcher; infoFetcher?: TokenInfoFetcher; now?: number },
-): Promise<{ candidates: MultiCandidate[]; rejected: RejectedCandidate[] }> {
+): Promise<{ candidates: MultiCandidate[]; rejected: RejectedCandidate[]; sourceError?: CandidateSourceError }> {
   if (!config.enabled) {
     return { candidates: [], rejected: [] };
   }
@@ -115,9 +127,13 @@ export async function fetchAndFilterCandidates(
       interval: '6h',
       limit: Math.min(100, Math.max(config.topN * 5, 50)),
     });
-  } catch {
-    // Fetch failure fails closed: no candidates, no crash.
-    return { candidates: [], rejected: [] };
+  } catch (e) {
+    // Fetch failure fails closed (no candidates, no crash) but is reported
+    // distinctly from a genuinely empty result — never silently coerced
+    // into "0 candidates today".
+    const code = e instanceof GmgnError ? e.code : 'CANDIDATE_SOURCE_UNKNOWN_ERROR';
+    const message = e instanceof Error ? e.message : String(e);
+    return { candidates: [], rejected: [], sourceError: { code, message } };
   }
 
   const afterBaseFilters: MultiCandidate[] = [];

@@ -292,6 +292,38 @@ test('candidate source fetch failure returns no candidates and does not throw', 
   assert.equal(rejected.length, 0);
 });
 
+test('candidate-source failure is distinguishable from a genuinely empty result (never silently collapsed together)', async () => {
+  const cfg = baseConfig();
+
+  const failed = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => {
+      throw new Error('GMGN unreachable');
+    },
+  });
+  assert.equal(failed.candidates.length, 0);
+  assert.ok(failed.sourceError, 'a source failure must set sourceError');
+  assert.equal(failed.sourceError!.code, 'CANDIDATE_SOURCE_UNKNOWN_ERROR');
+
+  const genuinelyEmpty = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => [], // the source responded fine, there's just nothing trending right now
+  });
+  assert.equal(genuinelyEmpty.candidates.length, 0);
+  assert.equal(genuinelyEmpty.sourceError, undefined, 'a genuinely empty (but successful) fetch must NOT set sourceError');
+});
+
+test('a GmgnError from the CLI layer propagates its specific error code into sourceError', async () => {
+  const { GmgnError } = await import('../src/gmgn/cli.js');
+  const cfg = baseConfig();
+  const { candidates, sourceError } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => {
+      throw new GmgnError('gmgn-cli not found', undefined, 'GMGN_CLI_NOT_FOUND');
+    },
+  });
+  assert.equal(candidates.length, 0);
+  assert.equal(sourceError?.code, 'GMGN_CLI_NOT_FOUND');
+  assert.match(sourceError!.message, /not found/);
+});
+
 test('disabled config returns no candidates without calling the fetcher', async () => {
   const cfg = baseConfig({ enabled: false });
   let called = false;

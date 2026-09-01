@@ -1,16 +1,31 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import crossSpawn from 'cross-spawn';
 import type { Address } from 'viem';
 import { type SupportedChainId } from '../config.js';
-
-const pExecFile = promisify(execFile);
 
 /**
  * gmgn-cli wrapper.
  *
  * Security rules:
- * 1. Always invoke via execFile with an ARGUMENT ARRAY — never a shell string.
- * 2. Validate every address before it becomes an argv entry.
+ * 1. Always invoke with a structured ARGUMENT ARRAY — never a shell string
+ *    built by concatenating/interpolating values. `cross-spawn` is used
+ *    instead of Node's raw `execFile()` because on Windows, a global npm
+ *    install of gmgn-cli produces a `.cmd` shim, which `execFile()` cannot
+ *    launch at all without a shell (confirmed: fails with ENOENT for a
+ *    bare name, EINVAL even with the `.cmd` extension given explicitly —
+ *    this is a genuine Windows/Node limitation, not a bug in this file).
+ *    `cross-spawn` handles the required Windows shell layer AND correctly
+ *    escapes each argument for cmd.exe's parsing rules — POSIX is
+ *    unaffected (no shell is used there).
+ * 2. `cross-spawn`'s escaping was verified empirically against a battery of
+ *    shell-metacharacter payloads and closes most injection vectors, but
+ *    one gap was found (a literal double-quote combined with `&` can still
+ *    break out — see test/gmgnCli.test.ts). Because of that, rule 2 is not
+ *    "trust the escaping" — it's `assertSafeCliArg()` below: every argument
+ *    is validated against a strict allowlist before it ever reaches the
+ *    process boundary, regardless of which spawn mechanism is used. No
+ *    legitimate gmgn-cli argument in this file (chain name, 0x address,
+ *    numeric value, order id, orderBy field name) ever needs a shell
+ *    metacharacter or a quote, so rejecting them outright costs nothing.
  * 3. Credentials live in ~/.config/gmgn/ and are read by gmgn-cli itself.
  */
 
@@ -21,20 +36,147 @@ export const GMGN_NATIVE = '0x0000000000000000000000000000000000000000' as Addre
 
 const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Explicit, machine-checkable failure classification (spec: candidate
+ * absence and candidate-source failure must be distinguishable — a source
+ * failure must never be silently reported the same way as "genuinely zero
+ * results").
+ */
+export type GmgnErrorCode =
+  | 'GMGN_CLI_NOT_FOUND'
+  | 'GMGN_CLI_TIMEOUT'
+  | 'GMGN_CLI_NONZERO_EXIT'
+  | 'GMGN_CLI_EXEC_FAILED'
+  | 'GMGN_CLI_EMPTY_OUTPUT'
+  | 'GMGN_CLI_MALFORMED_OUTPUT'
+  | 'GMGN_CLI_RATE_LIMITED'
+  | 'GMGN_CLI_AUTH_FAILED'
+  | 'GMGN_CLI_INVALID_INPUT'
+  | 'GMGN_ERROR';
 
 export class GmgnError extends Error {
-  constructor(message: string, readonly stderr?: string) {
+  readonly code: GmgnErrorCode;
+  constructor(message: string, readonly stderr?: string, code: GmgnErrorCode = 'GMGN_ERROR') {
     super(message);
     this.name = 'GmgnError';
+    this.code = code;
   }
 }
 
 /** 429. `resetAt` is a unix seconds timestamp when GMGN reports one. */
 export class GmgnRateLimitError extends GmgnError {
   constructor(message: string, readonly resetAt: number | null) {
-    super(message);
+    super(message, undefined, 'GMGN_CLI_RATE_LIMITED');
     this.name = 'GmgnRateLimitError';
   }
+}
+
+/**
+ * Defense-in-depth allowlist gate (see security rule 2 above). Every
+ * gmgn-cli argument in this file is already validated at its own call
+ * site (address regex, numeric coercion, order-id regex, hardcoded chain
+ * enums) — this is a second, universal check applied right before the
+ * process boundary so no future call site can accidentally skip it.
+ */
+const UNSAFE_ARG_RE = /["`$&|;<>^%!\r\n]/;
+
+function assertSafeCliArg(arg: string): string {
+  if (UNSAFE_ARG_RE.test(arg)) {
+    throw new GmgnError(
+      `Refusing to pass an unsafe character to gmgn-cli in argument: ${JSON.stringify(arg.slice(0, 80))}`,
+      undefined,
+      'GMGN_CLI_INVALID_INPUT',
+    );
+  }
+  return arg;
+}
+
+type CliProcessError = Error & {
+  code?: string | number | null;
+  killed?: boolean;
+  signal?: string | null;
+  stdout?: string;
+  stderr?: string;
+};
+
+/**
+ * Cross-platform process runner for gmgn-cli, replacing Node's raw
+ * `execFile()` (see security rule 1). Mirrors `execFile`'s well-known
+ * error shape (`.code`, `.killed`, `.signal`, `.stdout`, `.stderr`) so the
+ * classification logic in `gmgnJson()` reads the same way.
+ */
+/** Exported for tests only — real cross-platform spawn coverage without requiring gmgn-cli to be installed (see test/gmgnCli.test.ts). */
+export function runGmgnProcess(
+  file: string,
+  args: string[],
+  opts: { timeoutMs: number; maxBufferBytes: number; env: NodeJS.ProcessEnv },
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = crossSpawn(file, args, { env: opts.env });
+    let stdout = '';
+    let stderr = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+    }, opts.timeoutMs);
+
+    const finish = (err: CliProcessError | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) {
+        err.stdout = stdout;
+        err.stderr = stderr;
+        reject(err);
+      } else {
+        resolve({ stdout, stderr });
+      }
+    };
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > opts.maxBufferBytes) {
+        child.kill('SIGTERM');
+        finish(Object.assign(new Error('gmgn-cli stdout exceeded maxBuffer'), { code: 'ERR_MAXBUFFER' }));
+        return;
+      }
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > opts.maxBufferBytes) {
+        child.kill('SIGTERM');
+        finish(Object.assign(new Error('gmgn-cli stderr exceeded maxBuffer'), { code: 'ERR_MAXBUFFER' }));
+        return;
+      }
+      stderr += chunk.toString('utf8');
+    });
+
+    child.on('error', (err: CliProcessError) => finish(err));
+
+    child.on('close', (code, signal) => {
+      if (timedOut) {
+        finish(Object.assign(new Error(`gmgn-cli timed out after ${opts.timeoutMs}ms`), {
+          killed: true,
+          signal: signal ?? 'SIGTERM',
+          code,
+        }));
+        return;
+      }
+      if (code !== 0) {
+        finish(Object.assign(new Error(`gmgn-cli exited with code ${code}`), { code, signal }));
+        return;
+      }
+      finish(null);
+    });
+  });
 }
 
 export function gmgnChainName(chainId: SupportedChainId): GmgnChainName {
@@ -93,22 +235,21 @@ function looksRateLimited(text: string): boolean {
  */
 export async function gmgnJson<T>(
   args: string[],
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; maxBufferBytes?: number; runner?: typeof runGmgnProcess } = {},
 ): Promise<T> {
-  const timeout = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxBufferBytes = opts.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES;
+  const runner = opts.runner ?? runGmgnProcess;
+  const safeArgs = args.map(assertSafeCliArg);
   let stdout = '';
   let stderr = '';
 
   try {
-    const r = await pExecFile(cliPath(), args, {
-      timeout,
-      maxBuffer: 8 * 1024 * 1024,
-      env: process.env,
-    });
+    const r = await runner(cliPath(), safeArgs, { timeoutMs, maxBufferBytes, env: process.env });
     stdout = r.stdout;
     stderr = r.stderr;
   } catch (e) {
-    const err = e as Error & { stdout?: string; stderr?: string; code?: number };
+    const err = e as CliProcessError;
     stdout = err.stdout ?? '';
     stderr = err.stderr ?? '';
     const blob = `${stdout}\n${stderr}\n${err.message}`;
@@ -118,24 +259,42 @@ export async function gmgnJson<T>(
         extractResetAt(blob),
       );
     }
-    if (/ENOENT/.test(err.message)) {
+    if (err.code === 'ENOENT') {
       throw new GmgnError(
         `gmgn-cli not found (tried "${cliPath()}"). Install it or set GMGN_CLI_PATH.\n` +
-          `Zapout / screener need gmgn-cli + a GMGN API key in ~/.config/gmgn/.`,
+          `Zapout / screener / MULTI need gmgn-cli + a GMGN API key in ~/.config/gmgn/.`,
+        stderr,
+        'GMGN_CLI_NOT_FOUND',
+      );
+    }
+    if (err.killed) {
+      throw new GmgnError(
+        `gmgn-cli ${args.slice(0, 2).join(' ')} timed out after ${timeoutMs}ms`,
+        stderr,
+        'GMGN_CLI_TIMEOUT',
       );
     }
     // Auth / missing key — make the message actionable for zapout
     if (/api.?key|unauthorized|401|403|not configured|login|sign/i.test(blob)) {
       throw new GmgnError(
         `GMGN auth failed — configure API key in ~/.config/gmgn/ (gmgn-cli config).\n` +
-          `Without a GMGN key, zapout and screener cannot run.\n` +
+          `Without a GMGN key, zapout, screener, and MULTI cannot run.\n` +
           `${(stderr || err.message).slice(0, 200)}`,
         stderr,
+        'GMGN_CLI_AUTH_FAILED',
+      );
+    }
+    if (typeof err.code === 'number') {
+      throw new GmgnError(
+        `gmgn-cli ${args.slice(0, 2).join(' ')} exited with code ${err.code}: ${(stderr || err.message).slice(0, 400)}`,
+        stderr,
+        'GMGN_CLI_NONZERO_EXIT',
       );
     }
     throw new GmgnError(
       `gmgn-cli ${args.slice(0, 2).join(' ')} failed: ${(stderr || err.message).slice(0, 400)}`,
       stderr,
+      'GMGN_CLI_EXEC_FAILED',
     );
   }
 
@@ -145,7 +304,11 @@ export async function gmgnJson<T>(
 
   const trimmed = stdout.trim();
   if (!trimmed) {
-    throw new GmgnError(`gmgn-cli ${args.slice(0, 2).join(' ')} returned no output`);
+    throw new GmgnError(
+      `gmgn-cli ${args.slice(0, 2).join(' ')} returned no output`,
+      stderr,
+      'GMGN_CLI_EMPTY_OUTPUT',
+    );
   }
 
   let parsed: unknown;
@@ -154,6 +317,8 @@ export async function gmgnJson<T>(
   } catch {
     throw new GmgnError(
       `gmgn-cli ${args.slice(0, 2).join(' ')} returned non-JSON: ${trimmed.slice(0, 300)}`,
+      stderr,
+      'GMGN_CLI_MALFORMED_OUTPUT',
     );
   }
 
@@ -164,10 +329,14 @@ export async function gmgnJson<T>(
       if (/api.?key|unauthorized|auth|401|403/i.test(String(msg))) {
         throw new GmgnError(
           `GMGN auth failed (${env.code}): ${msg}. Configure ~/.config/gmgn/ — no key means no zapout.`,
+          stderr,
+          'GMGN_CLI_AUTH_FAILED',
         );
       }
       throw new GmgnError(
         `gmgn-cli ${args.slice(0, 2).join(' ')} error ${env.code}: ${msg}`,
+        stderr,
+        'GMGN_CLI_NONZERO_EXIT',
       );
     }
     return env.data as T;

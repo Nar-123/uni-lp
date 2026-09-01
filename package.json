@@ -27,6 +27,7 @@
     "@uniswap/sdk-core": "^7.7.2",
     "@uniswap/v3-sdk": "^3.25.2",
     "@uniswap/v4-sdk": "^2.3.0",
+    "cross-spawn": "^7.0.6",
     "dotenv": "^16.5.0",
     "ethers": "^5.7.2",
     "grammy": "^1.36.1",
@@ -35,6 +36,7 @@
     "viem": "^2.30.0"
   },
   "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
     "@types/node": "^22.15.0",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"
