@@ -25,6 +25,7 @@ import {
   v4PositionManagerAbi,
 } from './abis.js';
 import { getHotWalletAddress, getPublicClient, getWalletClient } from './clients.js';
+import { estimateWriteGas } from './gas.js';
 import {
   Token,
   Ether,
@@ -38,6 +39,7 @@ import {
   fetchUniswapV4PoolsForToken,
   type DexPair,
   getTokenPriceUsd,
+  getCriticalTokenPriceUsd,
   formatUsd,
 } from '../price/dexscreener.js';
 import { fetchTopV4Pools } from '../price/uniswapExplore.js';
@@ -86,6 +88,7 @@ import {
   classifyOwnershipError,
   computeWithdrawalMins,
   priceCompleteFor,
+  resolveReceivedAmount,
 } from './safety.js';
 
 export type V4PoolKey = {
@@ -438,23 +441,34 @@ export async function createV4PoolAndMintSingleSided(params: {
     }
 
     if (!already) {
+      const initArgs = [
+        {
+          currency0: poolKey.currency0,
+          currency1: poolKey.currency1,
+          fee: poolKey.fee,
+          tickSpacing: poolKey.tickSpacing,
+          hooks: poolKey.hooks,
+        },
+        sqrtPriceX96,
+      ] as const;
+      const initGas = await estimateWriteGas({
+        client,
+        address: posm,
+        abi: v4PositionManagerAbi,
+        functionName: 'initializePool',
+        args: initArgs,
+        account: wallet.account!.address,
+        fallbackGas: 500_000n,
+        context: 'v4 initializePool',
+      });
       const hash = await wallet.writeContract({
         address: posm,
         abi: v4PositionManagerAbi,
         functionName: 'initializePool',
-        args: [
-          {
-            currency0: poolKey.currency0,
-            currency1: poolKey.currency1,
-            fee: poolKey.fee,
-            tickSpacing: poolKey.tickSpacing,
-            hooks: poolKey.hooks,
-          },
-          sqrtPriceX96,
-        ],
+        args: initArgs,
         account: wallet.account!,
         chain: wallet.chain,
-        gas: 500_000n,
+        gas: initGas,
       });
       const receipt = await client.waitForTransactionReceipt({ hash });
       if (receipt.status !== 'success') {
@@ -1484,6 +1498,18 @@ export async function mintV4SingleSided(params: V4MintParams): Promise<V4MintRes
     functionName: 'nextTokenId',
   });
 
+  const mintGas = await estimateWriteGas({
+    client,
+    address: posm,
+    abi: v4PositionManagerAbi,
+    functionName: 'modifyLiquidities',
+    args: [unlockData, deadline],
+    account: wallet.account!.address,
+    value,
+    fallbackGas: 1_200_000n,
+    context: 'v4 mint',
+  });
+
   const hash = await wallet.writeContract({
     address: posm,
     abi: v4PositionManagerAbi,
@@ -1492,7 +1518,7 @@ export async function mintV4SingleSided(params: V4MintParams): Promise<V4MintRes
     account: wallet.account!,
     chain: wallet.chain,
     value,
-    gas: 1_200_000n,
+    gas: mintGas,
   });
 
   const receipt = await client.waitForTransactionReceipt({ hash });
@@ -1541,12 +1567,78 @@ export async function mintV4SingleSided(params: V4MintParams): Promise<V4MintRes
   const token1Addr =
     poolKey.currency1.toLowerCase() === ZERO ? wrapped : poolKey.currency1;
 
+  // ACTUAL deposited amounts: amount0Desired/amount1Desired is the ceiling
+  // offered to the mint call, not what the contract actually pulled in for
+  // the fixed liquidity amount that was minted. v4's mint is liquidity-
+  // first (unlike v3's amount-based mint, which refunds unused input) —
+  // the position's real on-chain liquidity, re-priced against current pool
+  // state, is the correct actual figure (same approach getV4Position()
+  // already uses for any existing position's principal amounts).
+  let actualAmount0 = amount0Desired;
+  let actualAmount1 = amount1Desired;
+  try {
+    const mintedLiquidity = (await client.readContract({
+      address: posm,
+      abi: v4PositionManagerAbi,
+      functionName: 'getPositionLiquidity',
+      args: [tokenId],
+    })) as bigint;
+    if (mintedLiquidity > 0n) {
+      const [meta0, meta1] = await Promise.all([
+        getTokenMeta(chainId, token0Addr),
+        getTokenMeta(chainId, token1Addr),
+      ]);
+      const actual = await computeV4AmountsForLiquidity({
+        chainId,
+        poolKey,
+        poolId,
+        token0Addr,
+        token1Addr,
+        decimals0: meta0.decimals,
+        decimals1: meta1.decimals,
+        symbol0: meta0.symbol,
+        symbol1: meta1.symbol,
+        tickLower: finalLower,
+        tickUpper: finalUpper,
+        liquidity: mintedLiquidity,
+      });
+      actualAmount0 = actual.amount0;
+      actualAmount1 = actual.amount1;
+    }
+  } catch (e) {
+    console.warn(`[v4 mint] #${tokenId} could not re-derive actual deposited amounts, using offered ceiling:`, e);
+  }
+
+  // Gas telemetry (Phase 3 §17) — v4 mint previously had none at all.
+  // Best-effort: never blocks/fails the already-successful mint.
+  try {
+    const { recordExecutionTelemetry } = await import('../db/index.js');
+    const { buildGasTelemetry } = await import('./gas.js');
+    const telemetryGas = await buildGasTelemetry(client, hash, mintGas);
+    recordExecutionTelemetry({
+      chainId,
+      opType: 'mint-v4',
+      dex: 'uniswap',
+      slippageBpsUsed: 0,
+      quoteSource: 'v4-mint-liquidity-repriced',
+      legs: [
+        { token: token0Addr, estimatedRaw: amount0Desired.toString(), minRaw: '0', actualRaw: actualAmount0.toString() },
+        { token: token1Addr, estimatedRaw: amount1Desired.toString(), minRaw: '0', actualRaw: actualAmount1.toString() },
+      ],
+      txHash: hash,
+      ok: true,
+      gas: telemetryGas,
+    });
+  } catch {
+    /* telemetry is best-effort only */
+  }
+
   return {
     protocol: 'v4',
     hash,
     tokenId,
-    amount0: amount0Desired,
-    amount1: amount1Desired,
+    amount0: actualAmount0,
+    amount1: actualAmount1,
     tickLower: finalLower,
     tickUpper: finalUpper,
     currentTick: pool.tick,
@@ -2253,10 +2345,15 @@ export async function getV4Position(
   const a1 = humanToFloat(amount1, meta1.decimals);
   const f0 = humanToFloat(tokensOwed0, meta0.decimals);
   const f1 = humanToFloat(tokensOwed1, meta1.decimals);
-  const [p0, p1] = await Promise.all([
-    getTokenPriceUsd(chainId, token0Addr),
-    getTokenPriceUsd(chainId, token1Addr),
+  // Critical path (feeds TP/SL via computePositionPnl → pnlPct) — see the
+  // matching comment in positions.ts's getPosition(). Stale/unavailable
+  // becomes null, which priceCompleteFor already treats as UNKNOWN.
+  const [r0, r1] = await Promise.all([
+    getCriticalTokenPriceUsd(chainId, token0Addr),
+    getCriticalTokenPriceUsd(chainId, token1Addr),
   ]);
+  const p0 = r0.ok ? r0.price : null;
+  const p1 = r1.ok ? r1.price : null;
   const valueUsd = a0 * (p0 ?? 0) + a1 * (p1 ?? 0);
   const unclaimedFeesUsd = f0 * (p0 ?? 0) + f1 * (p1 ?? 0);
   const priceComplete = priceCompleteFor({ amount0: a0 + f0, amount1: a1 + f1, p0, p1 });
@@ -2448,10 +2545,14 @@ export type V4CloseResult = {
   protocol: 'v4';
   hash: Hash;
   tokenId: bigint;
+  /** ACTUAL amount received, measured via wallet/native balance delta — see Phase 3 accounting audit. */
   amount0: bigint;
   amount1: bigint;
   amount0Human: number;
   amount1Human: number;
+  /** Pre-close estimate (position-liquidity math, computed before the transaction) — kept for auditability. */
+  expected0: bigint;
+  expected1: bigint;
   withdrawalUsd: number;
   feesPortionUsd: number;
   txLink: string;
@@ -2496,8 +2597,15 @@ export async function closeV4Position(
    */
   const computeMins = async (
     liquidity: bigint,
-  ): Promise<{ amount0Min: bigint; amount1Min: bigint }> => {
-    if (liquidity <= 0n) return { amount0Min: 0n, amount1Min: 0n };
+  ): Promise<{
+    amount0Min: bigint;
+    amount1Min: bigint;
+    expected0: bigint;
+    expected1: bigint;
+  }> => {
+    if (liquidity <= 0n) {
+      return { amount0Min: 0n, amount1Min: 0n, expected0: 0n, expected1: 0n };
+    }
     const { amount0, amount1 } = await computeV4AmountsForLiquidity({
       chainId,
       poolKey,
@@ -2512,16 +2620,18 @@ export async function closeV4Position(
       tickUpper: pos.tickUpper,
       liquidity,
     });
-    return computeWithdrawalMins({
+    const mins = computeWithdrawalMins({
       expected0: amount0,
       expected1: amount1,
       slippageBps: CLOSE_SLIPPAGE_BPS,
       context: `closeV4Position #${tokenId}`,
     });
+    return { ...mins, expected0: amount0, expected1: amount1 };
   };
 
   let liveLiq = await readLiveLiquidity();
   const initialMins = await computeMins(liveLiq);
+  let lastMins = initialMins;
 
   console.log(
     `[close v4] #${tokenId} liveLiq=${liveLiq} fee=${poolKey.fee} ` +
@@ -2529,62 +2639,89 @@ export async function closeV4Position(
       `min0=${initialMins.amount0Min} min1=${initialMins.amount1Min}`,
   );
 
+  // TAKE_PAIR sends native (currency == 0x0) directly, ERC-20 otherwise.
+  const readLegBalance = async (currency: Address): Promise<bigint> =>
+    currency.toLowerCase() === ZERO
+      ? client.getBalance({ address: recipient })
+      : (client.readContract({
+          address: currency,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [recipient],
+        }) as Promise<bigint>);
+
+  const leg0Before = await readLegBalance(c0);
+  const leg1Before = await readLegBalance(c1);
+
+  const recordTelemetry = async (params: {
+    ok: boolean;
+    txHash?: Hash;
+    errorMsg?: string;
+  }): Promise<void> => {
+    try {
+      const { recordExecutionTelemetry } = await import('../db/index.js');
+      let actual0: string | null = null;
+      let actual1: string | null = null;
+      if (params.ok) {
+        const [leg0After, leg1After] = await Promise.all([
+          readLegBalance(c0),
+          readLegBalance(c1),
+        ]);
+        actual0 = resolveReceivedAmount({
+          balanceBefore: leg0Before,
+          balanceAfter: leg0After,
+        }).toString();
+        actual1 = resolveReceivedAmount({
+          balanceBefore: leg1Before,
+          balanceAfter: leg1After,
+        }).toString();
+      }
+      const { buildGasTelemetry } = await import('./gas.js');
+      const gas = params.ok && params.txHash
+        ? await buildGasTelemetry(client, params.txHash)
+        : null;
+      recordExecutionTelemetry({
+        chainId,
+        opType: 'close-v4',
+        slippageBpsUsed: CLOSE_SLIPPAGE_BPS,
+        quoteSource: 'v4-sdk-position-liquidity-math',
+        legs: [
+          {
+            token: c0,
+            estimatedRaw: lastMins.expected0.toString(),
+            minRaw: lastMins.amount0Min.toString(),
+            actualRaw: actual0,
+          },
+          {
+            token: c1,
+            estimatedRaw: lastMins.expected1.toString(),
+            minRaw: lastMins.amount1Min.toString(),
+            actualRaw: actual1,
+          },
+        ],
+        txHash: params.txHash ?? null,
+        ok: params.ok,
+        errorMsg: params.errorMsg,
+        gas,
+      });
+    } catch {
+      /* telemetry is best-effort only */
+    }
+  };
+
   const deadline = () => BigInt(Math.floor(Date.now() / 1000) + 1800);
-
-  type Attempt = { name: string; data: Hex; gas: bigint };
-  const attempts: Attempt[] = [];
-
-  // 1) Full exit: BURN + TAKE, protected by expected-withdrawal mins
-  attempts.push({
-    name: 'BURN+TAKE',
-    data: encodeBurnUnlockData({
-      tokenId,
-      amount0Min: initialMins.amount0Min,
-      amount1Min: initialMins.amount1Min,
-      currency0: c0,
-      currency1: c1,
-      recipient,
-    }),
-    gas: 1_200_000n,
-  });
-
-  // 2) DECREASE all + TAKE (keep NFT; often more reliable)
-  if (liveLiq > 0n) {
-    attempts.push({
-      name: 'DECREASE+TAKE',
-      data: encodeDecreaseTakeUnlockData({
-        tokenId,
-        liquidity: liveLiq,
-        amount0Min: initialMins.amount0Min,
-        amount1Min: initialMins.amount1Min,
-        currency0: c0,
-        currency1: c1,
-        recipient,
-      }),
-      gas: 1_000_000n,
-    });
-  }
-
-  // 3) Fees only (liq already 0 — nothing to protect, collect whatever is owed)
-  attempts.push({
-    name: 'COLLECT_FEES',
-    data: encodeCollectFeesUnlockData({
-      tokenId,
-      currency0: c0,
-      currency1: c1,
-      recipient,
-    }),
-    gas: 600_000n,
-  });
 
   const { withRetries, sleep } = await import('./retry.js');
   let used = '';
-  const hash = await withRetries(
+  let hash: Hash;
+  try {
+    hash = await withRetries(
     async (round) => {
       // Refresh liq AND expected-withdrawal mins each round — a retry must
       // refresh data and rerun the safety gate, never reuse a stale minimum.
       const liq = await readLiveLiquidity();
       const mins = await computeMins(liq);
+      lastMins = mins;
       const roundAttempts: { name: string; data: Hex; gas: bigint }[] = [
         {
           name: 'BURN+TAKE',
@@ -2639,6 +2776,16 @@ export async function closeV4Position(
             args: [att.data, dl],
             account: recipient,
           });
+          const attGas = await estimateWriteGas({
+            client,
+            address: posm,
+            abi: v4PositionManagerAbi,
+            functionName: 'modifyLiquidities',
+            args: [att.data, dl],
+            account: wallet.account!.address,
+            fallbackGas: att.gas,
+            context: `close-v4 #${tokenId} ${att.name}`,
+          });
           const h = await wallet.writeContract({
             address: posm,
             abi: v4PositionManagerAbi,
@@ -2646,7 +2793,7 @@ export async function closeV4Position(
             args: [att.data, dl],
             account: wallet.account!,
             chain: wallet.chain,
-            gas: att.gas,
+            gas: attGas,
           });
           const receipt = await client.waitForTransactionReceipt({ hash: h });
           if (receipt.status !== 'success') {
@@ -2674,7 +2821,13 @@ export async function closeV4Position(
         return !/not found|already empty|not authorized|NotApproved/i.test(m);
       },
     },
-  );
+    );
+  } catch (e) {
+    const errorMsg = e instanceof Error ? e.message : String(e);
+    await recordTelemetry({ ok: false, errorMsg });
+    throw e;
+  }
+  await recordTelemetry({ ok: true, txHash: hash });
 
   // Best-effort burn shell if we only decreased
   if (used === 'DECREASE+TAKE' || used === 'COLLECT_FEES') {
@@ -2695,21 +2848,33 @@ export async function closeV4Position(
           recipient,
         });
         // Only burn if it sim succeeds
+        const burnDeadline = deadline();
+        const burnArgs = [burnData, burnDeadline] as const;
         await client.simulateContract({
           address: posm,
           abi: v4PositionManagerAbi,
           functionName: 'modifyLiquidities',
-          args: [burnData, deadline()],
+          args: burnArgs,
           account: recipient,
+        });
+        const burnGas = await estimateWriteGas({
+          client,
+          address: posm,
+          abi: v4PositionManagerAbi,
+          functionName: 'modifyLiquidities',
+          args: burnArgs,
+          account: wallet.account!.address,
+          fallbackGas: 400_000n,
+          context: `close-v4 #${tokenId} empty-shell burn`,
         });
         const bh = await wallet.writeContract({
           address: posm,
           abi: v4PositionManagerAbi,
           functionName: 'modifyLiquidities',
-          args: [burnData, deadline()],
+          args: burnArgs,
           account: wallet.account!,
           chain: wallet.chain,
-          gas: 400_000n,
+          gas: burnGas,
         });
         await client.waitForTransactionReceipt({ hash: bh });
       }
@@ -2718,15 +2883,42 @@ export async function closeV4Position(
     }
   }
 
-  const amount0 = pos.amount0;
-  const amount1 = pos.amount1;
-  const a0 = pos.amount0Human;
-  const a1 = pos.amount1Human;
+  // Pre-close estimate (position-liquidity math computed before the
+  // transaction) — kept as `expected0`/`expected1` for auditability, never
+  // used as the final realized withdrawal below.
+  const expected0 = pos.amount0;
+  const expected1 = pos.amount1;
+
+  // ACTUAL amount received, measured via balance delta (native or ERC-20,
+  // matching readLegBalance's own currency handling). The best-effort
+  // empty-shell burn above never moves currency balances, so reading here
+  // reflects exactly what the close transaction delivered. Falls back to
+  // the pre-close estimate only if no delta was observed.
+  const [leg0After, leg1After] = await Promise.all([readLegBalance(c0), readLegBalance(c1)]);
+  const amount0 = resolveReceivedAmount({
+    balanceBefore: leg0Before,
+    balanceAfter: leg0After,
+    fallbackEstimate: expected0,
+  });
+  const amount1 = resolveReceivedAmount({
+    balanceBefore: leg1Before,
+    balanceAfter: leg1After,
+    fallbackEstimate: expected1,
+  });
+  const a0 = humanToFloat(amount0, pos.decimals0);
+  const a1 = humanToFloat(amount1, pos.decimals1);
   const [p0, p1] = await Promise.all([
     getTokenPriceUsd(chainId, pos.token0),
     getTokenPriceUsd(chainId, pos.token1),
   ]);
   const withdrawalUsd = a0 * (p0 ?? 0) + a1 * (p1 ?? 0);
+  // v4's BURN+TAKE/DECREASE+TAKE unlock path collects principal and fees
+  // together in one transfer — there is no separate on-chain event that
+  // splits them, same limitation v3's combined decrease+collect has. Use
+  // the pre-close unclaimed-fee estimate as the fee portion (matching v3's
+  // existing approach) rather than the previous hardcoded 0, which made
+  // v4 closes never record a separate fee_claim ledger entry at all.
+  const feesPortionUsd = pos.unclaimedFeesUsd;
 
   return {
     protocol: 'v4',
@@ -2736,8 +2928,10 @@ export async function closeV4Position(
     amount1,
     amount0Human: a0,
     amount1Human: a1,
+    expected0,
+    expected1,
     withdrawalUsd,
-    feesPortionUsd: 0,
+    feesPortionUsd,
     txLink: txUrl(chainId, hash),
     token0: pos.token0,
     token1: pos.token1,
@@ -2793,35 +2987,110 @@ export async function claimV4Fees(
     `[claim v4] #${tokenId} fees0=${fees0} fees1=${fees1} estUsd=${pos.unclaimedFeesUsd}`,
   );
 
+  const readLegBalance = async (currency: Address): Promise<bigint> =>
+    currency.toLowerCase() === ZERO
+      ? client.getBalance({ address: recipient })
+      : (client.readContract({
+          address: currency,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [recipient],
+        }) as Promise<bigint>);
+
+  const leg0Before = await readLegBalance(c0);
+  const leg1Before = await readLegBalance(c1);
+
+  const claimArgs = [data, deadline] as const;
+
   await client.simulateContract({
     address: posm,
     abi: v4PositionManagerAbi,
     functionName: 'modifyLiquidities',
-    args: [data, deadline],
+    args: claimArgs,
     account: recipient,
+  });
+
+  const claimGas = await estimateWriteGas({
+    client,
+    address: posm,
+    abi: v4PositionManagerAbi,
+    functionName: 'modifyLiquidities',
+    args: claimArgs,
+    account: wallet.account!.address,
+    fallbackGas: 700_000n,
+    context: `claim-v4-fees #${tokenId}`,
   });
 
   const hash = await wallet.writeContract({
     address: posm,
     abi: v4PositionManagerAbi,
     functionName: 'modifyLiquidities',
-    args: [data, deadline],
+    args: claimArgs,
     account: wallet.account!,
     chain: wallet.chain,
-    gas: 700_000n,
+    gas: claimGas,
   });
-  await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash });
+  if (receipt.status !== 'success') {
+    throw new Error(`claim-v4-fees #${tokenId} tx reverted: ${hash}`);
+  }
+
+  // ACTUAL collected amount via balance delta — fees0/fees1 (pos.tokensOwed0/1)
+  // is the pre-claim estimate and must not be reported as the final claimed
+  // amount. Falls back to that estimate only if no delta was observed.
+  const [leg0After, leg1After] = await Promise.all([readLegBalance(c0), readLegBalance(c1)]);
+  const actual0 = resolveReceivedAmount({
+    balanceBefore: leg0Before,
+    balanceAfter: leg0After,
+    fallbackEstimate: fees0,
+  });
+  const actual1 = resolveReceivedAmount({
+    balanceBefore: leg1Before,
+    balanceAfter: leg1After,
+    fallbackEstimate: fees1,
+  });
+  const a0 = humanToFloat(actual0, pos.decimals0);
+  const a1 = humanToFloat(actual1, pos.decimals1);
+  const [p0, p1] = await Promise.all([
+    getTokenPriceUsd(chainId, pos.token0),
+    getTokenPriceUsd(chainId, pos.token1),
+  ]);
+  const feesUsd = a0 * (p0 ?? 0) + a1 * (p1 ?? 0);
+
+  // Gas telemetry (Phase 3 §17) — claim-v4-fees previously had none at
+  // all. Best-effort: never blocks/fails the already-successful claim.
+  try {
+    const { recordExecutionTelemetry } = await import('../db/index.js');
+    const { buildGasTelemetry } = await import('./gas.js');
+    const gas = await buildGasTelemetry(client, hash, claimGas);
+    recordExecutionTelemetry({
+      chainId,
+      opType: 'claim-fees-v4',
+      dex: 'uniswap',
+      slippageBpsUsed: 0,
+      quoteSource: 'v4-position-tokensOwed-snapshot',
+      legs: [
+        { token: pos.token0, estimatedRaw: fees0.toString(), minRaw: '0', actualRaw: actual0.toString() },
+        { token: pos.token1, estimatedRaw: fees1.toString(), minRaw: '0', actualRaw: actual1.toString() },
+      ],
+      txHash: hash,
+      ok: true,
+      gas,
+    });
+  } catch {
+    /* telemetry is best-effort only */
+  }
 
   return {
     hash,
     tokenId,
-    feesUsd: pos.unclaimedFeesUsd,
-    fees0,
-    fees1,
+    feesUsd,
+    fees0: actual0,
+    fees1: actual1,
     symbol0: pos.symbol0,
     symbol1: pos.symbol1,
-    amount0Human: humanToFloat(fees0, pos.decimals0),
-    amount1Human: humanToFloat(fees1, pos.decimals1),
+    amount0Human: a0,
+    amount1Human: a1,
     txLink: txUrl(chainId, hash),
   };
 }

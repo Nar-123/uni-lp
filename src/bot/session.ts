@@ -4,6 +4,7 @@ import type { ListedPool } from '../chain/pools.js';
 import { getUserPrefs, type DepositMode, type SizeMode } from '../db/index.js';
 import type { AggregatedPreview } from '../chain/aggregate.js';
 import type { FoundApproval } from '../chain/revoke.js';
+import type { MultiStrategyRun } from '../strategy/types.js';
 
 export type FlowStep =
   | 'idle'
@@ -134,6 +135,8 @@ export type UserSession = {
     rank: number;
   }[];
   screenerPage?: number;
+  /** /multi last dry-run result (candidates + intents) for the Execute buttons */
+  multiRun?: MultiStrategyRun;
 };
 
 const sessions = new Map<number, UserSession>();

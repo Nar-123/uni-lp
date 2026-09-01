@@ -12,6 +12,7 @@ import {
   classifyOwnershipError,
   priceCompleteFor,
   resolveReceivedAmount,
+  computeRealizedSlippageBps,
   CLOSE_SLIPPAGE_BPS,
 } from '../src/chain/safety.js';
 
@@ -227,4 +228,29 @@ test('WETH: no delta and no fallback estimate → 0, never sweeps existing balan
   const before = 1_000_000_000_000_000_000n;
   const after = 1_000_000_000_000_000_000n;
   assert.equal(resolveReceivedAmount({ balanceBefore: before, balanceAfter: after }), 0n);
+});
+
+// ── Phase 2: realized-slippage telemetry math (for future data-driven
+// calibration of the flat slippage constants — see PHASE2 report) ──────
+
+test('computeRealizedSlippageBps: actual below estimate → positive bps (worse than estimated)', () => {
+  // Estimated 1000, actually received 950 → 5% (500 bps) worse than estimate
+  assert.equal(computeRealizedSlippageBps(1000n, 950n), 500);
+});
+
+test('computeRealizedSlippageBps: actual matches estimate → 0', () => {
+  assert.equal(computeRealizedSlippageBps(1000n, 1000n), 0);
+});
+
+test('computeRealizedSlippageBps: actual above estimate → negative bps (better than estimated)', () => {
+  assert.equal(computeRealizedSlippageBps(1000n, 1100n), -1000);
+});
+
+test('computeRealizedSlippageBps: unmeasurable actual (null) → null, never a fabricated number', () => {
+  assert.equal(computeRealizedSlippageBps(1000n, null), null);
+});
+
+test('computeRealizedSlippageBps: no estimate to compare against → null', () => {
+  assert.equal(computeRealizedSlippageBps(0n, 900n), null);
+  assert.equal(computeRealizedSlippageBps(-1n, 900n), null);
 });

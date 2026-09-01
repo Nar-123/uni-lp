@@ -21,7 +21,8 @@ export type DexPair = {
   url?: string;
 };
 
-const priceCache = new Map<string, { usd: number; at: number }>();
+type PriceCacheEntry = { usd: number; at: number; source: string };
+const priceCache = new Map<string, PriceCacheEntry>();
 const CACHE_MS = 60_000; // 60s — enough for /list to reuse prices across positions
 
 function cacheKey(chainId: SupportedChainId, token: string): string {
@@ -195,15 +196,15 @@ export async function getTokenPriceUsd(
 
   // Stables
   if (c.usdg && c.usdg.toLowerCase() === lower) {
-    priceCache.set(key, { usd: 1, at: Date.now() });
+    priceCache.set(key, { usd: 1, at: Date.now(), source: 'stable-peg' });
     return 1;
   }
   if (c.usdt && c.usdt.toLowerCase() === lower) {
-    priceCache.set(key, { usd: 1, at: Date.now() });
+    priceCache.set(key, { usd: 1, at: Date.now(), source: 'stable-peg' });
     return 1;
   }
   if (c.usdc && c.usdc.toLowerCase() === lower) {
-    priceCache.set(key, { usd: 1, at: Date.now() });
+    priceCache.set(key, { usd: 1, at: Date.now(), source: 'stable-peg' });
     return 1;
   }
 
@@ -220,7 +221,7 @@ export async function getTokenPriceUsd(
       // Sanity: WETH/WBNB shouldn't be under $10 or over $1M
       const isWrapped = c.wrapped.toLowerCase() === lower;
       if (isWrapped && (px < 10 || px > 1_000_000)) continue;
-      priceCache.set(key, { usd: px, at: Date.now() });
+      priceCache.set(key, { usd: px, at: Date.now(), source: 'dexscreener' });
       return px;
     }
   }
@@ -237,7 +238,7 @@ export async function getTokenPriceUsd(
       for (const pair of match) {
         const px = priceUsdFromPair(pair, lower);
         if (px != null && px > 10 && px < 1_000_000) {
-          priceCache.set(key, { usd: px, at: Date.now() });
+          priceCache.set(key, { usd: px, at: Date.now(), source: 'dexscreener' });
           return px;
         }
       }
@@ -251,7 +252,7 @@ export async function getTokenPriceUsd(
       if (ethBest?.priceUsd) {
         const px = Number(ethBest.priceUsd);
         if (px > 10 && px < 1_000_000) {
-          priceCache.set(key, { usd: px, at: Date.now() });
+          priceCache.set(key, { usd: px, at: Date.now(), source: 'dexscreener-eth-mainnet-fallback' });
           return px;
         }
       }
@@ -261,6 +262,82 @@ export async function getTokenPriceUsd(
   }
 
   return null;
+}
+
+// ── Price freshness contract (Phase 2 Part 4) ─────────────────────────────
+
+export type PriceResult =
+  | { ok: true; price: number; source: string; timestamp: number }
+  | { ok: false; reason: string };
+
+/**
+ * Temporary conservative default — NOT a calibrated production value. Set
+ * via MAX_CRITICAL_PRICE_AGE_MS env if a different bound is needed; the
+ * default is deliberately a bit above (poll interval + cache TTL) so it
+ * doesn't fight the existing 60s DexScreener cache under normal operation,
+ * while still catching a genuinely stuck/stale price. Needs real
+ * calibration against observed price volatility before being treated as a
+ * production-tuned value — see PHASE2_PART4_AUDIT.md §7/§16.
+ */
+export const MAX_CRITICAL_PRICE_AGE_MS: number =
+  Number(process.env.MAX_CRITICAL_PRICE_AGE_MS) > 0
+    ? Number(process.env.MAX_CRITICAL_PRICE_AGE_MS)
+    : 90_000;
+
+export function isPriceStale(timestampMs: number, maxAgeMs: number = MAX_CRITICAL_PRICE_AGE_MS): boolean {
+  return Date.now() - timestampMs > maxAgeMs;
+}
+
+/**
+ * Critical-path price lookup for automated decisions (TP/SL, position
+ * valuation feeding PnL%). Returns the full {ok,price,source,timestamp}
+ * contract rather than a bare number, and NEVER silently hands back a
+ * stale price: if the cached (or freshly fetched) entry is older than
+ * `maxAgeMs`, it forces one bypass-cache refresh; if that refresh also
+ * fails or is still stale (e.g. the underlying source itself hasn't moved
+ * — can't happen with Date.now()-stamped cache, but defensive), it
+ * returns `ok:false` rather than a number a caller might mistake for a
+ * live price. Callers must treat `ok:false` as UNKNOWN — never as $0 and
+ * never as a reason to disable protection (see tpslLogic.ts's existing
+ * null-pnlPct-never-triggers contract, which this feeds into unchanged).
+ */
+export async function getCriticalTokenPriceUsd(
+  chainId: SupportedChainId,
+  tokenAddress: Address,
+  maxAgeMs: number = MAX_CRITICAL_PRICE_AGE_MS,
+): Promise<PriceResult> {
+  const c = CHAINS[chainId];
+  const resolved: Address =
+    tokenAddress.toLowerCase() === '0x0000000000000000000000000000000000000000'
+      ? c.wrapped
+      : tokenAddress;
+  const key = cacheKey(chainId, resolved);
+
+  try {
+    const price = await getTokenPriceUsd(chainId, tokenAddress);
+    if (price == null) return { ok: false, reason: 'price unavailable' };
+
+    let meta = priceCache.get(key);
+    if (!meta) return { ok: false, reason: 'price unavailable (no cache metadata)' };
+
+    if (isPriceStale(meta.at, maxAgeMs)) {
+      priceCache.delete(key); // force a real refetch, bypassing the cache hit
+      const fresh = await getTokenPriceUsd(chainId, tokenAddress);
+      meta = priceCache.get(key);
+      if (fresh == null || meta == null || isPriceStale(meta.at, maxAgeMs)) {
+        return { ok: false, reason: 'price stale and refresh failed' };
+      }
+      return { ok: true, price: fresh, source: meta.source, timestamp: meta.at };
+    }
+
+    return { ok: true, price, source: meta.source, timestamp: meta.at };
+  } catch (e) {
+    // A network/RPC-layer exception (e.g. DexScreener fetch failure) must
+    // resolve to the same UNKNOWN contract as a clean null — never
+    // propagate as an uncaught rejection that a caller might mishandle.
+    const msg = e instanceof Error ? e.message : String(e);
+    return { ok: false, reason: `price lookup failed: ${msg.slice(0, 160)}` };
+  }
 }
 
 export async function valueUsd(

@@ -2,6 +2,7 @@ import type { Address } from 'viem';
 import { CHAINS, SUPPORTED_CHAIN_IDS, type SupportedChainId } from '../config.js';
 import {
   getLedgerEntries,
+  listExecutionTelemetry,
   listTrackedPositions,
   sumAllLedger,
   sumLedger,
@@ -17,14 +18,90 @@ export type PositionPnl = {
   feesClaimedUsd: number;
   currentValueUsd: number;
   unclaimedFeesUsd: number;
-  /** current + unclaimed + withdrawals + fees_claimed - deposits */
+  /**
+   * GROSS PnL = current + unclaimed + withdrawals + fees_claimed - deposits.
+   * Proceeds/valuation minus capital deployed — does NOT subtract gas or
+   * swap execution costs. Kept as `pnlUsd`/`pnlPct` (unchanged name/
+   * formula/semantics) because TP/SL thresholds and existing displays are
+   * calibrated against this exact figure — Phase 3 does not change what
+   * feeds TP/SL. See `grossPnlUsd` (explicit alias) and `netPnlUsd` below.
+   */
   pnlUsd: number;
   pnlPct: number | null;
+  /** Explicit alias of `pnlUsd` — same value, named for clarity now that netPnlUsd exists alongside it. */
+  grossPnlUsd: number;
+  /**
+   * Known gas cost (USD) for this position's on-chain transactions,
+   * cross-referenced by txHash against execution_telemetry — `null`
+   * ("UNKNOWN") whenever any of the position's recorded transactions has
+   * no matching telemetry gas data (e.g. mint transactions currently
+   * carry no gas telemetry at all — see PHASE3_ACCOUNTING_AUDIT.md). Never
+   * fabricated as 0.
+   */
+  gasCostUsd: number | null;
+  /** true only when gas cost was measurable for every one of this position's recorded transactions. */
+  gasCostComplete: boolean;
+  /**
+   * NET PnL = grossPnlUsd - gasCostUsd. `null` ("incomplete") whenever
+   * gasCostUsd is null — an unknown cost must never be silently treated
+   * as zero and folded into an apparently-authoritative net figure.
+   */
+  netPnlUsd: number | null;
 };
 
 /**
- * Reprice deposit rows using amount_human * live token price when available.
- * Fixes historical bad USD (e.g. WETH priced as meme via DexScreener quote bug).
+ * Best-effort gas-cost aggregation for one position, cross-referenced by
+ * txHash between this position's ledger rows and execution_telemetry.
+ * Returns `gasCostUsd: null` (UNKNOWN, not 0) whenever no telemetry gas
+ * data could be matched for the position's transactions, or the native
+ * token's USD price is itself unavailable.
+ */
+async function computePositionGasCostUsd(
+  chainId: SupportedChainId,
+  tokenId: string,
+): Promise<{ gasCostUsd: number | null; gasCostComplete: boolean }> {
+  const entries = getLedgerEntries(chainId, tokenId);
+  const hashes = new Set(
+    entries.map((e) => e.txHash).filter((h): h is string => h != null),
+  );
+  if (hashes.size === 0) return { gasCostUsd: null, gasCostComplete: false };
+
+  const telemetry = listExecutionTelemetry({ chainId });
+  const matched = telemetry.filter((t) => t.txHash != null && hashes.has(t.txHash));
+  if (matched.length === 0) return { gasCostUsd: null, gasCostComplete: false };
+
+  const nativePrice = await getTokenPriceUsd(chainId, CHAINS[chainId].wrapped);
+  let totalWei = 0n;
+  let known = 0;
+  for (const m of matched) {
+    const costWei = m.gas?.actualGasCostWei;
+    if (costWei != null) {
+      totalWei += BigInt(costWei);
+      known++;
+    }
+  }
+  if (known === 0 || nativePrice == null) return { gasCostUsd: null, gasCostComplete: false };
+  const gasCostUsd = (Number(totalWei) / 1e18) * nativePrice;
+  // "Complete" requires gas data for every transaction we found telemetry
+  // for AND telemetry existing for every recorded transaction — a partial
+  // match (e.g. mint has no telemetry, close does) is reported as an
+  // incomplete, best-effort figure, not a fabricated final number.
+  const gasCostComplete = known === matched.length && matched.length === hashes.size;
+  return { gasCostUsd, gasCostComplete };
+}
+
+/**
+ * Historical deposit cost basis: prefers each row's stored `usd` (the
+ * price-at-deposit-time value recorded by recordLedger at mint time) —
+ * the historical cost basis must NOT drift with the CURRENT market price
+ * of an open position (Phase 3 accounting audit: "historical price must
+ * not become current price inside historical accounting"). Only falls
+ * back to `amountHuman * live price` for rows whose stored `usd` is
+ * missing/zero/non-finite — a one-time compensating correction for
+ * deposit rows written before Phase 3 (e.g. a since-fixed DexScreener
+ * quote bug once caused WETH to be priced as the meme token at deposit
+ * time, storing a garbage `usd`). New deposits (Phase 3 onward) always
+ * have a valid stored `usd` and are never revalued here.
  */
 async function repriceDepositsUsd(
   chainId: SupportedChainId,
@@ -33,9 +110,13 @@ async function repriceDepositsUsd(
   const entries = getLedgerEntries(chainId, tokenId, 'deposit');
   if (entries.length === 0) return 0;
 
-  // Unique tokens → one price fetch each (parallel), then sum
+  // Only rows with an untrustworthy stored `usd` need a live-price lookup.
   const needPrice = entries.filter(
-    (e) => e.tokenAddress && e.amountHuman != null && e.amountHuman > 0,
+    (e) =>
+      !(Number.isFinite(e.usd) && e.usd > 0) &&
+      e.tokenAddress &&
+      e.amountHuman != null &&
+      e.amountHuman > 0,
   );
   const uniq = [
     ...new Set(needPrice.map((e) => (e.tokenAddress as string).toLowerCase())),
@@ -50,6 +131,10 @@ async function repriceDepositsUsd(
 
   let total = 0;
   for (const e of entries) {
+    if (Number.isFinite(e.usd) && e.usd > 0) {
+      total += e.usd;
+      continue;
+    }
     if (e.tokenAddress && e.amountHuman != null && e.amountHuman > 0) {
       const px = priceBy.get(e.tokenAddress.toLowerCase());
       if (px != null && px > 0) {
@@ -111,6 +196,9 @@ export async function computePositionPnl(
 
   const pnlPct = computePnlPct(pnlUsd, depositsUsd, live?.priceComplete);
 
+  const { gasCostUsd, gasCostComplete } = await computePositionGasCostUsd(chainId, id);
+  const netPnlUsd = gasCostUsd != null ? pnlUsd - gasCostUsd : null;
+
   return {
     tokenId: id,
     depositsUsd,
@@ -120,6 +208,10 @@ export async function computePositionPnl(
     unclaimedFeesUsd,
     pnlUsd,
     pnlPct,
+    grossPnlUsd: pnlUsd,
+    gasCostUsd,
+    gasCostComplete,
+    netPnlUsd,
   };
 }
 
@@ -127,8 +219,13 @@ export function formatPnl(p: PositionPnl): string {
   const sign = p.pnlUsd >= 0 ? '+' : '';
   const pct =
     p.pnlPct != null ? ` (${p.pnlPct >= 0 ? '+' : ''}${p.pnlPct.toFixed(2)}%)` : '';
+  const netLine =
+    p.netPnlUsd != null
+      ? `  Net (after gas) ${p.netPnlUsd >= 0 ? '+' : ''}${formatUsd(p.netPnlUsd)}\n`
+      : `  Net (after gas): DATA INCOMPLETE — gas cost unknown for one or more txs\n`;
   return (
-    `PnL ${sign}${formatUsd(p.pnlUsd)}${pct}\n` +
+    `Gross PnL ${sign}${formatUsd(p.pnlUsd)}${pct}\n` +
+    netLine +
     `  dep ${formatUsd(p.depositsUsd)} | wd ${formatUsd(p.withdrawalsUsd)} | ` +
     `fees claimed ${formatUsd(p.feesClaimedUsd)}\n` +
     `  now ${formatUsd(p.currentValueUsd)} + unclaimed ${formatUsd(p.unclaimedFeesUsd)}`
@@ -139,6 +236,10 @@ export async function portfolioSummary(
   chainId: SupportedChainId | null,
   liveTotalValue: number,
   liveUnclaimed: number,
+  /** Aggregate known gas cost (USD) across the portfolio's positions — `null`/omitted when unknown or not computed by the caller. */
+  gasCostUsd?: number | null,
+  /** true only when gas cost was measurable for every position's every recorded transaction. */
+  gasCostComplete?: boolean,
 ): Promise<string> {
   const dep = await repriceAllDepositsUsd(chainId);
   const wd = sumAllLedger(chainId, 'withdrawal');
@@ -146,8 +247,15 @@ export async function portfolioSummary(
   const pnl = liveTotalValue + liveUnclaimed + wd + fees - dep;
   const sign = pnl >= 0 ? '+' : '';
   const pct = dep > 1e-6 ? ` (${((pnl / dep) * 100) >= 0 ? '+' : ''}${((pnl / dep) * 100).toFixed(2)}%)` : '';
+  const netLine =
+    gasCostUsd != null
+      ? `Net (after gas) ${pnl - gasCostUsd >= 0 ? '+' : ''}${formatUsd(pnl - gasCostUsd)}` +
+        (gasCostComplete ? '' : ' (partial — some tx gas costs unknown)') +
+        '\n'
+      : `Net (after gas): DATA INCOMPLETE — gas cost unknown\n`;
   return (
-    `Portfolio PnL ${sign}${formatUsd(pnl)}${pct}\n` +
+    `Gross Portfolio PnL ${sign}${formatUsd(pnl)}${pct}\n` +
+    netLine +
     `deposits ${formatUsd(dep)} | withdrawals ${formatUsd(wd)} | fees claimed ${formatUsd(fees)}\n` +
     `open value ${formatUsd(liveTotalValue)} | unclaimed fees ${formatUsd(liveUnclaimed)}`
   );

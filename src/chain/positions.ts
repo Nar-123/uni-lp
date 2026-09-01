@@ -12,7 +12,7 @@ import { factoryAbi, npmAbi, poolAbi } from './abis.js';
 import { getHotWalletAddress, getPublicClient } from './clients.js';
 import { getTokenMeta, formatUnits, humanToFloat } from './tokens.js';
 import { resolvePoolFromFactory } from './pools.js';
-import { getTokenPriceUsd, formatUsd } from '../price/dexscreener.js';
+import { getTokenPriceUsd, getCriticalTokenPriceUsd, formatUsd } from '../price/dexscreener.js';
 import {
   formatCompactRange,
   formatEthVal,
@@ -659,10 +659,17 @@ export async function getPosition(
   const f0 = humanToFloat(tokensOwed0, meta0.decimals);
   const f1 = humanToFloat(tokensOwed1, meta1.decimals);
 
-  const [p0, p1] = await Promise.all([
-    getTokenPriceUsd(chainId, token0),
-    getTokenPriceUsd(chainId, token1),
+  // Critical path (feeds TP/SL via computePositionPnl → pnlPct): use the
+  // freshness-checked price lookup, not the bare cached number. A stale or
+  // unavailable price becomes p0/p1 = null here, which priceCompleteFor
+  // already treats as UNKNOWN (priceComplete=false → pnlPct=null → TP/SL
+  // takes no action) — never a fabricated $0.
+  const [r0, r1] = await Promise.all([
+    getCriticalTokenPriceUsd(chainId, token0),
+    getCriticalTokenPriceUsd(chainId, token1),
   ]);
+  const p0 = r0.ok ? r0.price : null;
+  const p1 = r1.ok ? r1.price : null;
   const valueUsd = a0 * (p0 ?? 0) + a1 * (p1 ?? 0);
   const unclaimedFeesUsd = f0 * (p0 ?? 0) + f1 * (p1 ?? 0);
   const priceComplete = priceCompleteFor({ amount0: a0 + f0, amount1: a1 + f1, p0, p1 });

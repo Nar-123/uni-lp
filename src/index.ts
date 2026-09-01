@@ -1,6 +1,6 @@
 import { config } from './config.js';
 import { getDb } from './db/index.js';
-import { getHotWalletAddress } from './chain/clients.js';
+import { getHotWalletAddress, runStartupTxRecovery } from './chain/clients.js';
 import { listWallets, getActiveWallet } from './wallet/keys.js';
 import { createBot } from './bot/bot.js';
 import { startTpslWatcher, stopTpslWatcher } from './bot/tpslWatcher.js';
@@ -8,6 +8,8 @@ import {
   startVolumeAlertWatcher,
   stopVolumeAlertWatcher,
 } from './bot/volumeAlertWatcher.js';
+import { recoverMissingLedger } from './pnl/reconcile.js';
+import { loadMultiConfig, validateMultiConfig } from './strategy/index.js';
 
 async function main() {
   getDb();
@@ -32,7 +34,59 @@ async function main() {
   // Ensure client account matches active
   void getHotWalletAddress();
 
+  // Phase 2 Part 4: resolve any transaction left unresolved by a prior
+  // crash/restart/RPC outage BEFORE the bot starts handling commands or
+  // the TP/SL watcher starts polling — new sends for an affected wallet
+  // are refused until this clears (see chain/clients.ts journalledSend).
+  try {
+    const { resolved, stillUnresolved } = await runStartupTxRecovery();
+    if (resolved > 0 || stillUnresolved > 0) {
+      console.log(
+        `[tx-recovery] startup complete: ${resolved} resolved, ${stillUnresolved} still unresolved`,
+      );
+    }
+  } catch (e) {
+    console.error('[tx-recovery] startup recovery pass failed (continuing):', e);
+  }
+
+  // Phase 3.5: Auto-recover any ledger events that were staged in journal
+  // accounting metadata but never written (process crashed after tx success
+  // but before recordLedger() completed).
+  try {
+    const recovery = recoverMissingLedger();
+    if (recovery.recovered > 0) {
+      console.log(
+        `[ledger-recovery] startup: recovered ${recovery.recovered} missing ledger event(s)`,
+      );
+    }
+    if (recovery.status === 'RECONCILIATION_REQUIRED') {
+      const needsAttention = recovery.findings.filter(
+        (f) => f.ledgerState !== 'MISSING_RECOVERED',
+      ).length;
+      console.warn(
+        `[ledger-recovery] startup: ${needsAttention} finding(s) require operator review — run /reconcile`,
+      );
+    }
+  } catch (e) {
+    console.error('[ledger-recovery] startup recovery pass failed (continuing):', e);
+  }
+
   const bot = createBot();
+
+  // Phase 4: MULTI strategy config validation. STRATEGY=multi is opt-in;
+  // any invalid/missing config leaves MULTI disabled — the bot itself still
+  // starts normally and default-strategy trading is entirely unaffected.
+  try {
+    const multiConfig = loadMultiConfig();
+    const validation = validateMultiConfig(multiConfig);
+    if (multiConfig.enabled && validation.valid) {
+      console.log(`[multi] enabled (chain=${multiConfig.chainId}, usdg=${multiConfig.usdgAddress})`);
+    } else {
+      console.log(`[multi] DISABLED: ${multiConfig.disabledReason ?? validation.reason ?? 'invalid config'}`);
+    }
+  } catch (e) {
+    console.error('[multi] startup config check failed (MULTI disabled):', e);
+  }
 
   // Ensure long-polling mode (no webhook) so getUpdates works
   try {
@@ -62,6 +116,8 @@ async function main() {
       { command: 'pnl', description: 'Portfolio PnL summary' },
       { command: 'history', description: 'Per-position PnL from ledger' },
       { command: 'generate', description: 'PnL card image · /generate #id' },
+      { command: 'reconcile', description: 'Accounting reconciliation check (operator)' },
+      { command: 'multi', description: 'MULTI strategy candidates (dry-run) · execute' },
       { command: 'tp', description: 'TP/SL enroll · /tp #id [tp sl|off|list]' },
       { command: 'add', description: 'Mint LP (paste CA → pick pool)' },
       { command: 'cancel', description: 'Cancel current flow' },

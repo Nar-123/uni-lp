@@ -132,6 +132,27 @@ export function computeWithdrawalMins(params: {
 export const CLOSE_SLIPPAGE_BPS = 1000; // 10%
 
 /**
+ * How much worse (positive) or better (negative) the ACTUAL received amount
+ * was vs the pre-trade ESTIMATE, in basis points of the estimate.
+ *
+ * This is the metric Phase 2 telemetry records per trade so a future pass
+ * can data-drive the flat slippage constants (DEFAULT_SWAP_SLIPPAGE_BPS,
+ * CLOSE_SLIPPAGE_BPS, etc.) from real fill history instead of guessing —
+ * e.g. "for pools with >$50k liquidity, realized slippage never exceeded
+ * 180bps across N trades" would justify tightening that bucket's bound.
+ * Returns null when there's nothing meaningful to compare (no estimate, or
+ * actual wasn't measurable).
+ */
+export function computeRealizedSlippageBps(
+  estimatedRaw: bigint,
+  actualRaw: bigint | null,
+): number | null {
+  if (estimatedRaw <= 0n || actualRaw == null || actualRaw < 0n) return null;
+  const diff = estimatedRaw - actualRaw; // positive = received less than estimated
+  return Number((diff * 10_000n) / estimatedRaw);
+}
+
+/**
  * Classify an `ownerOf`-style revert message.
  *
  * 'gone' — the contract explicitly reverted with a "no such token" error

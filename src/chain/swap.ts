@@ -22,7 +22,21 @@ import { getHotWalletAddress, getPublicClient, getWalletClient } from './clients
 import { formatUnits, getTokenMeta, humanToFloat, humanToRaw } from './tokens.js';
 import { weth9Abi } from './wrap.js';
 import { getTokenPriceUsd, formatUsd } from '../price/dexscreener.js';
-import { computeSwapMinOut, requirePositiveMinOut, SafetyError } from './safety.js';
+import {
+  computeSwapMinOut,
+  requirePositiveMinOut,
+  resolveReceivedAmount,
+  SafetyError,
+} from './safety.js';
+import {
+  getExecutableQuoteV3,
+  isQuoteStale,
+  LOCAL_QUOTE_MAX_AGE_MS,
+  sqrtPriceRatio,
+  type QuoteResult,
+  type MinimalReadClient,
+} from './quote.js';
+import { estimateWriteGas } from './gas.js';
 
 /** SwapRouter02 exactInputSingle / exactInput (no deadline field) — Uniswap */
 const swapRouter02Abi = [
@@ -185,6 +199,8 @@ export type SwapPreview = {
   tokenIn: Address;
   symbol: string;
   decimals: number;
+  /** ms epoch — real quote timestamp; see isQuoteStale/LOCAL_QUOTE_MAX_AGE_MS in quote.ts */
+  quotedAt: number;
   amountIn: bigint;
   amountInHuman: number;
   valueUsd: number;
@@ -317,31 +333,26 @@ export async function estimateAmountOut(
   amountIn: bigint,
   decimalsIn: number,
   decimalsOut: number,
+  client: MinimalReadClient = getPublicClient(chainId),
 ): Promise<bigint> {
-  const client = getPublicClient(chainId);
   const [token0, slot0] = await Promise.all([
     client.readContract({ address: poolAddress, abi: poolAbi, functionName: 'token0' }),
     client.readContract({ address: poolAddress, abi: poolAbi, functionName: 'slot0' }),
   ]);
-  const sqrtPriceX96 = slot0[0] as bigint;
+  const sqrtPriceX96 = (slot0 as readonly unknown[])[0] as bigint;
   if (sqrtPriceX96 === 0n || amountIn === 0n) return 0n;
 
-  // price = (sqrtP / 2^96)^2 = token1 per token0 (raw)
-  // use float carefully for estimate only
-  const sqrtP = Number(sqrtPriceX96) / 2 ** 96;
-  if (!Number.isFinite(sqrtP) || sqrtP <= 0) return 0n;
-  const price1Per0 = sqrtP * sqrtP;
-
   const zeroForOne = tokenIn.toLowerCase() === (token0 as string).toLowerCase();
+  // Decimals-adjusted price (outHuman per 1 inHuman) — sqrtPriceRatio()
+  // already accounts for decimalsIn/decimalsOut possibly differing (e.g.
+  // WETH 18dec / USDC 6dec), unlike a raw (sqrtP/2^96)^2 ratio applied
+  // directly to human-unit amounts, which was wrong by 10^|decimalsIn -
+  // decimalsOut| whenever the pair's decimals differ. See
+  // PHASE2_PART3_AUDIT.md §9 and test/swap.decimals.test.ts.
+  const priceRatio = sqrtPriceRatio(sqrtPriceX96, decimalsIn, decimalsOut, zeroForOne);
+  if (priceRatio == null) return 0n;
   const amountInHuman = Number(amountIn) / 10 ** decimalsIn;
-  let outHuman: number;
-  if (zeroForOne) {
-    // selling token0 → get token1
-    outHuman = amountInHuman * price1Per0;
-  } else {
-    // selling token1 → get token0
-    outHuman = amountInHuman / price1Per0;
-  }
+  const outHuman = amountInHuman * priceRatio;
   if (!Number.isFinite(outHuman) || outHuman <= 0) return 0n;
   // apply ~pool fee already small; leave for slippage param
   const raw = BigInt(Math.floor(outHuman * 10 ** decimalsOut));
@@ -408,20 +419,36 @@ export async function previewSwapToNative(
   let fee = 0;
   let poolAddress: Address = CHAINS[chainId].wrapped;
   let routeLabel = '';
+  let quotedAt = Date.now();
   const venue = dexLabel(route.dex);
+  const wrappedMeta = await getTokenMeta(chainId, CHAINS[chainId].wrapped);
 
   if (route.kind === 'single') {
     fee = route.fee;
     poolAddress = route.poolAddress;
     routeLabel = `${venue} direct · fee ${(fee / 10000).toFixed(2)}%`;
-    estimatedOut = await estimateAmountOut(
+    const q = await getExecutableQuoteV3({
       chainId,
-      route.poolAddress,
-      token,
-      amt,
-      meta.decimals,
-      18,
-    );
+      poolAddress: route.poolAddress,
+      tokenIn: token,
+      tokenOut: CHAINS[chainId].wrapped,
+      decimalsIn: meta.decimals,
+      decimalsOut: wrappedMeta.decimals,
+      symbolIn: meta.symbol,
+      symbolOut: wrappedMeta.symbol,
+      nameIn: meta.name,
+      nameOut: wrappedMeta.name,
+      fee,
+      amountIn: amt,
+    });
+    if (!q.ok) {
+      throw new SafetyError(
+        `[safety] previewSwapToNative: no real executable quote for ${meta.symbol}→` +
+          `${CHAINS[chainId].wrappedSymbol} (${q.code}: ${q.reason}) — aborting, no rough-estimate fallback`,
+      );
+    }
+    estimatedOut = q.amountOut;
+    quotedAt = q.quotedAt;
   } else {
     fee = route.feeIn;
     poolAddress = route.poolIn;
@@ -429,33 +456,50 @@ export async function previewSwapToNative(
       `${venue} via ${route.midSymbol} · ` +
       `${(route.feeIn / 10000).toFixed(2)}% + ${(route.feeOut / 10000).toFixed(2)}%`;
     const midMeta = await getTokenMeta(chainId, route.mid);
-    const midOut = await estimateAmountOut(
+    const qIn = await getExecutableQuoteV3({
       chainId,
-      route.poolIn,
-      token,
-      amt,
-      meta.decimals,
-      midMeta.decimals,
-    );
-    if (midOut > 0n) {
-      estimatedOut = await estimateAmountOut(
-        chainId,
-        route.poolOut,
-        route.mid,
-        midOut,
-        midMeta.decimals,
-        18,
+      poolAddress: route.poolIn,
+      tokenIn: token,
+      tokenOut: route.mid,
+      decimalsIn: meta.decimals,
+      decimalsOut: midMeta.decimals,
+      symbolIn: meta.symbol,
+      symbolOut: midMeta.symbol,
+      nameIn: meta.name,
+      nameOut: midMeta.name,
+      fee: route.feeIn,
+      amountIn: amt,
+    });
+    if (!qIn.ok) {
+      throw new SafetyError(
+        `[safety] previewSwapToNative: no real executable quote for leg ${meta.symbol}→${midMeta.symbol} ` +
+          `(${qIn.code}: ${qIn.reason}) — aborting, no rough-estimate fallback`,
       );
     }
+    const qOut = await getExecutableQuoteV3({
+      chainId,
+      poolAddress: route.poolOut,
+      tokenIn: route.mid,
+      tokenOut: CHAINS[chainId].wrapped,
+      decimalsIn: midMeta.decimals,
+      decimalsOut: wrappedMeta.decimals,
+      symbolIn: midMeta.symbol,
+      symbolOut: wrappedMeta.symbol,
+      nameIn: midMeta.name,
+      nameOut: wrappedMeta.name,
+      fee: route.feeOut,
+      amountIn: qIn.amountOut,
+    });
+    if (!qOut.ok) {
+      throw new SafetyError(
+        `[safety] previewSwapToNative: no real executable quote for leg ${midMeta.symbol}→` +
+          `${CHAINS[chainId].wrappedSymbol} (${qOut.code}: ${qOut.reason}) — aborting, no rough-estimate fallback`,
+      );
+    }
+    estimatedOut = qOut.amountOut;
+    quotedAt = qOut.quotedAt;
   }
 
-  // Quote failure must abort, not silently fall back to an unprotected minOut=0 swap.
-  if (estimatedOut <= 0n) {
-    throw new SafetyError(
-      `[safety] previewSwapToNative: no valid quote for ${meta.symbol}→` +
-        `${CHAINS[chainId].wrappedSymbol} (route ${routeLabel || 'n/a'}) — aborting`,
-    );
-  }
   const amountOutMinimum = computeSwapMinOut({
     estimatedOut,
     slippageBps,
@@ -469,6 +513,7 @@ export async function previewSwapToNative(
     tokenIn: token,
     symbol: meta.symbol,
     decimals: meta.decimals,
+    quotedAt,
     amountIn: amt,
     amountInHuman: human,
     valueUsd: human * px,
@@ -588,10 +633,61 @@ export async function swapTokenToNative(
   }
 
   const { withRetries } = await import('./retry.js');
-  return withRetries(
-    async (round) => {
-      const preview = await previewSwapToNative(chainId, token, amountIn, slippageBps);
-      const dex = preview.dex;
+  const nativeBefore = await client.getBalance({ address: owner });
+  let lastPreview: SwapPreview | undefined;
+
+  const recordTelemetry = async (params: {
+    ok: boolean;
+    txHash?: Hash;
+    errorMsg?: string;
+  }): Promise<void> => {
+    if (!lastPreview) return;
+    try {
+      const { recordExecutionTelemetry } = await import('../db/index.js');
+      let actualRaw: string | null = null;
+      if (params.ok) {
+        const nativeAfter = await client.getBalance({ address: owner });
+        actualRaw = resolveReceivedAmount({
+          balanceBefore: nativeBefore,
+          balanceAfter: nativeAfter,
+        }).toString();
+      }
+      const { buildGasTelemetry } = await import('./gas.js');
+      const gas = params.ok && params.txHash
+        ? await buildGasTelemetry(client, params.txHash)
+        : null;
+      recordExecutionTelemetry({
+        chainId,
+        opType: 'swap',
+        dex: lastPreview.dex,
+        slippageBpsUsed: lastPreview.slippageBps,
+        quoteSource: 'v3-pool-simulation',
+        quotedAt: lastPreview.quotedAt,
+        route: lastPreview.routeLabel,
+        legs: [
+          {
+            token: CHAINS[chainId].wrapped,
+            estimatedRaw: lastPreview.estimatedOut.toString(),
+            minRaw: lastPreview.amountOutMinimum.toString(),
+            actualRaw,
+          },
+        ],
+        txHash: params.txHash ?? null,
+        ok: params.ok,
+        errorMsg: params.errorMsg,
+        gas,
+      });
+    } catch {
+      /* telemetry is best-effort only */
+    }
+  };
+
+  try {
+    const result = await withRetries(
+      async (round) => {
+        const preview = await previewSwapToNative(chainId, token, amountIn, slippageBps);
+        lastPreview = preview;
+        const dex = preview.dex;
       const { swapRouter: router } = resolveV3Contracts(chainId, dex);
       const wrapped = CHAINS[chainId].wrapped;
       const owner = getHotWalletAddress();
@@ -602,6 +698,16 @@ export async function swapTokenToNative(
       const deadline = swapDeadline();
 
       await ensureAllowance(chainId, token, router, preview.amountIn);
+
+      // ensureAllowance can involve a real approve tx+wait — the quote
+      // fetched before it may no longer be fresh by the time we're about
+      // to use it. Refuse to trade on a stale quote; failing this round
+      // simply moves to the next retry round, which re-quotes from scratch.
+      if (isQuoteStale(preview.quotedAt)) {
+        throw new Error(
+          `[safety] swapTokenToNative: quote is stale (age > ${LOCAL_QUOTE_MAX_AGE_MS}ms) after allowance step — refusing to trade on it`,
+        );
+      }
 
       // Single, non-degrading minOut derived from the fresh quote above.
       // Retries refresh the quote (previewSwapToNative is re-run each round)
@@ -658,6 +764,16 @@ export async function swapTokenToNative(
                 args: [[swapData, unwrapData]],
                 account: owner,
               });
+              const gasPcsMulti = await estimateWriteGas({
+                client,
+                address: router,
+                abi: pcsSwapRouterAbi,
+                functionName: 'multicall',
+                args: [[swapData, unwrapData]],
+                account: wallet.account!.address,
+                fallbackGas: 900_000n,
+                context: 'swapTokenToNative PCS multi-hop multicall',
+              });
               const hash = await wallet.writeContract({
                 address: router,
                 abi: pcsSwapRouterAbi,
@@ -665,7 +781,7 @@ export async function swapTokenToNative(
                 args: [[swapData, unwrapData]],
                 account: wallet.account!,
                 chain: wallet.chain,
-                gas: 900_000n,
+                gas: gasPcsMulti,
               });
               const receipt = await client.waitForTransactionReceipt({ hash });
               if (receipt.status !== 'success') throw new Error(`Swap tx reverted: ${hash}`);
@@ -684,6 +800,16 @@ export async function swapTokenToNative(
               args: [[swapData, unwrapData]],
               account: owner,
             });
+            const gasUniMulti = await estimateWriteGas({
+              client,
+              address: router,
+              abi: swapRouter02Abi,
+              functionName: 'multicall',
+              args: [[swapData, unwrapData]],
+              account: wallet.account!.address,
+              fallbackGas: 900_000n,
+              context: 'swapTokenToNative multi-hop multicall',
+            });
             const hash = await wallet.writeContract({
               address: router,
               abi: swapRouter02Abi,
@@ -691,7 +817,7 @@ export async function swapTokenToNative(
               args: [[swapData, unwrapData]],
               account: wallet.account!,
               chain: wallet.chain,
-              gas: 900_000n,
+              gas: gasUniMulti,
             });
             const receipt = await client.waitForTransactionReceipt({ hash });
             if (receipt.status !== 'success') throw new Error(`Swap tx reverted: ${hash}`);
@@ -776,6 +902,16 @@ export async function swapTokenToNative(
                 args: [[swapData, unwrapData]],
                 account: owner,
               });
+              const gasPcsDirect = await estimateWriteGas({
+                client,
+                address: pRouter,
+                abi: pcsSwapRouterAbi,
+                functionName: 'multicall',
+                args: [[swapData, unwrapData]],
+                account: wallet.account!.address,
+                fallbackGas: 700_000n,
+                context: 'swapTokenToNative PCS direct multicall',
+              });
               const hash = await wallet.writeContract({
                 address: pRouter,
                 abi: pcsSwapRouterAbi,
@@ -783,7 +919,7 @@ export async function swapTokenToNative(
                 args: [[swapData, unwrapData]],
                 account: wallet.account!,
                 chain: wallet.chain,
-                gas: 700_000n,
+                gas: gasPcsDirect,
               });
               const receipt = await client.waitForTransactionReceipt({ hash });
               if (receipt.status !== 'success') {
@@ -806,6 +942,16 @@ export async function swapTokenToNative(
               args: [[swapData, unwrapData]],
               account: owner,
             });
+            const gasUniDirect = await estimateWriteGas({
+              client,
+              address: pRouter,
+              abi: swapRouter02Abi,
+              functionName: 'multicall',
+              args: [[swapData, unwrapData]],
+              account: wallet.account!.address,
+              fallbackGas: 700_000n,
+              context: 'swapTokenToNative direct multicall',
+            });
             const hash = await wallet.writeContract({
               address: pRouter,
               abi: swapRouter02Abi,
@@ -813,7 +959,7 @@ export async function swapTokenToNative(
               args: [[swapData, unwrapData]],
               account: wallet.account!,
               chain: wallet.chain,
-              gas: 700_000n,
+              gas: gasUniDirect,
             });
             const receipt = await client.waitForTransactionReceipt({ hash });
             if (receipt.status !== 'success') {
@@ -846,45 +992,67 @@ export async function swapTokenToNative(
             try {
               let hash1: Hash;
               if (pIsPcs) {
+                const pcsSingleArgs = [
+                  {
+                    tokenIn: token,
+                    tokenOut: wrapped,
+                    fee: p.fee,
+                    recipient: owner,
+                    deadline,
+                    amountIn: preview.amountIn,
+                    amountOutMinimum: minOut,
+                    sqrtPriceLimitX96: 0n,
+                  },
+                ] as const;
+                const gasPcsSingle = await estimateWriteGas({
+                  client,
+                  address: pRouter,
+                  abi: pcsSwapRouterAbi,
+                  functionName: 'exactInputSingle',
+                  args: pcsSingleArgs,
+                  account: wallet.account!.address,
+                  fallbackGas: 500_000n,
+                  context: 'swapTokenToNative PCS single fallback',
+                });
                 hash1 = await wallet.writeContract({
                   address: pRouter,
                   abi: pcsSwapRouterAbi,
                   functionName: 'exactInputSingle',
-                  args: [
-                    {
-                      tokenIn: token,
-                      tokenOut: wrapped,
-                      fee: p.fee,
-                      recipient: owner,
-                      deadline,
-                      amountIn: preview.amountIn,
-                      amountOutMinimum: minOut,
-                      sqrtPriceLimitX96: 0n,
-                    },
-                  ],
+                  args: pcsSingleArgs,
                   account: wallet.account!,
                   chain: wallet.chain,
-                  gas: 500_000n,
+                  gas: gasPcsSingle,
                 });
               } else {
+                const uniSingleArgs = [
+                  {
+                    tokenIn: token,
+                    tokenOut: wrapped,
+                    fee: p.fee,
+                    recipient: owner,
+                    amountIn: preview.amountIn,
+                    amountOutMinimum: minOut,
+                    sqrtPriceLimitX96: 0n,
+                  },
+                ] as const;
+                const gasUniSingle = await estimateWriteGas({
+                  client,
+                  address: pRouter,
+                  abi: swapRouter02Abi,
+                  functionName: 'exactInputSingle',
+                  args: uniSingleArgs,
+                  account: wallet.account!.address,
+                  fallbackGas: 500_000n,
+                  context: 'swapTokenToNative single fallback',
+                });
                 hash1 = await wallet.writeContract({
                   address: pRouter,
                   abi: swapRouter02Abi,
                   functionName: 'exactInputSingle',
-                  args: [
-                    {
-                      tokenIn: token,
-                      tokenOut: wrapped,
-                      fee: p.fee,
-                      recipient: owner,
-                      amountIn: preview.amountIn,
-                      amountOutMinimum: minOut,
-                      sqrtPriceLimitX96: 0n,
-                    },
-                  ],
+                  args: uniSingleArgs,
                   account: wallet.account!,
                   chain: wallet.chain,
-                  gas: 500_000n,
+                  gas: gasUniSingle,
                 });
               }
               const r1 = await client.waitForTransactionReceipt({ hash: hash1 });
@@ -925,9 +1093,16 @@ export async function swapTokenToNative(
         `Swap failed round ${round}/${3} after ${allPools.length} fee tier(s). ` +
           `Last: ${lastErr.slice(0, 220)}`,
       );
-    },
-    { times: 3, backoffMs: 1000, label: 'swapTokenToNative' },
-  );
+      },
+      { times: 3, backoffMs: 1000, label: 'swapTokenToNative' },
+    );
+    await recordTelemetry({ ok: true, txHash: result.hash });
+    return result;
+  } catch (e) {
+    const errorMsg = e instanceof Error ? e.message : String(e);
+    await recordTelemetry({ ok: false, errorMsg });
+    throw e;
+  }
 }
 
 export function formatSwapPreview(p: SwapPreview, chainId: SupportedChainId): string {
@@ -1108,58 +1283,172 @@ async function swapExactInLocal(
   await ensureAllowance(chainId, tokenIn, router, amountIn);
 
   const { withRetries } = await import('./retry.js');
-  return withRetries(
-    async (round) => {
+  const outBefore = await client.readContract({
+    address: tokenOut,
+    abi: erc20Abi,
+    functionName: 'balanceOf',
+    args: [owner],
+  });
+  let lastEstimatedOut = 0n;
+  let lastMinOut = 0n;
+  let lastImpactBps: number | null = null;
+  let lastQuotedAt: number | undefined;
+
+  const recordTelemetry = async (params: {
+    ok: boolean;
+    txHash?: Hash;
+    errorMsg?: string;
+  }): Promise<void> => {
+    if (lastEstimatedOut <= 0n) return;
+    try {
+      const { recordExecutionTelemetry } = await import('../db/index.js');
+      let actualRaw: string | null = null;
+      if (params.ok) {
+        const outAfter = await client.readContract({
+          address: tokenOut,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [owner],
+        });
+        actualRaw = resolveReceivedAmount({
+          balanceBefore: outBefore,
+          balanceAfter: outAfter,
+        }).toString();
+      }
+      const { buildGasTelemetry } = await import('./gas.js');
+      const gas = params.ok && params.txHash
+        ? await buildGasTelemetry(client, params.txHash)
+        : null;
+      recordExecutionTelemetry({
+        chainId,
+        opType: 'swap',
+        dex,
+        slippageBpsUsed: slippageBps,
+        priceImpactBps: lastImpactBps,
+        quoteSource: 'v3-pool-simulation',
+        quotedAt: lastQuotedAt,
+        route: route.kind === 'single' ? `direct · fee ${route.fee}` : `via ${route.midSymbol}`,
+        legs: [
+          {
+            token: tokenOut,
+            estimatedRaw: lastEstimatedOut.toString(),
+            minRaw: lastMinOut.toString(),
+            actualRaw,
+          },
+        ],
+        txHash: params.txHash ?? null,
+        ok: params.ok,
+        errorMsg: params.errorMsg,
+        gas,
+      });
+    } catch {
+      /* telemetry is best-effort only */
+    }
+  };
+
+  try {
+    const result = await withRetries(
+      async (round) => {
       const deadline = swapDeadline();
 
       // Fresh quote every round — retries must never reuse a stale estimate
       // or weaken protection; they refresh data and rerun the safety gate.
-      let estimatedOut = 0n;
+      // Real executable quote only — no rough-estimate fallback for capital
+      // execution (see quote.ts / PHASE2_PART2_QUOTE_AUDIT.md).
+      let estimatedOut: bigint;
+      let quotedAt: number;
       if (route.kind === 'single') {
-        estimatedOut = await estimateAmountOut(
+        const q = await getExecutableQuoteV3({
           chainId,
-          route.poolAddress,
+          poolAddress: route.poolAddress,
           tokenIn,
+          tokenOut,
+          decimalsIn: metaIn.decimals,
+          decimalsOut: metaOut.decimals,
+          symbolIn: metaIn.symbol,
+          symbolOut: metaOut.symbol,
+          nameIn: metaIn.name,
+          nameOut: metaOut.name,
+          fee: route.fee,
           amountIn,
-          metaIn.decimals,
-          metaOut.decimals,
-        );
-      } else {
-        const midMeta = await getTokenMeta(chainId, route.mid);
-        const midOut = await estimateAmountOut(
-          chainId,
-          route.poolIn,
-          tokenIn,
-          amountIn,
-          metaIn.decimals,
-          midMeta.decimals,
-        );
-        if (midOut > 0n) {
-          estimatedOut = await estimateAmountOut(
-            chainId,
-            route.poolOut,
-            route.mid,
-            midOut,
-            midMeta.decimals,
-            metaOut.decimals,
+        });
+        if (!q.ok) {
+          throw new SafetyError(
+            `[safety] swapExactInLocal: no real executable quote for ${metaIn.symbol}→${metaOut.symbol} ` +
+              `(${q.code}: ${q.reason}) — aborting, no rough-estimate fallback`,
           );
         }
+        estimatedOut = q.amountOut;
+        quotedAt = q.quotedAt;
+      } else {
+        const midMeta = await getTokenMeta(chainId, route.mid);
+        const qIn = await getExecutableQuoteV3({
+          chainId,
+          poolAddress: route.poolIn,
+          tokenIn,
+          tokenOut: route.mid,
+          decimalsIn: metaIn.decimals,
+          decimalsOut: midMeta.decimals,
+          symbolIn: metaIn.symbol,
+          symbolOut: midMeta.symbol,
+          nameIn: metaIn.name,
+          nameOut: midMeta.name,
+          fee: route.feeIn,
+          amountIn,
+        });
+        if (!qIn.ok) {
+          throw new SafetyError(
+            `[safety] swapExactInLocal: no real executable quote for leg ${metaIn.symbol}→${midMeta.symbol} ` +
+              `(${qIn.code}: ${qIn.reason}) — aborting, no rough-estimate fallback`,
+          );
+        }
+        const qOut = await getExecutableQuoteV3({
+          chainId,
+          poolAddress: route.poolOut,
+          tokenIn: route.mid,
+          tokenOut,
+          decimalsIn: midMeta.decimals,
+          decimalsOut: metaOut.decimals,
+          symbolIn: midMeta.symbol,
+          symbolOut: metaOut.symbol,
+          nameIn: midMeta.name,
+          nameOut: metaOut.name,
+          fee: route.feeOut,
+          amountIn: qIn.amountOut,
+        });
+        if (!qOut.ok) {
+          throw new SafetyError(
+            `[safety] swapExactInLocal: no real executable quote for leg ${midMeta.symbol}→${metaOut.symbol} ` +
+              `(${qOut.code}: ${qOut.reason}) — aborting, no rough-estimate fallback`,
+          );
+        }
+        estimatedOut = qOut.amountOut;
+        quotedAt = qOut.quotedAt;
       }
+      lastEstimatedOut = estimatedOut;
+      lastQuotedAt = quotedAt;
 
-      if (estimatedOut <= 0n) {
-        throw new SafetyError(
-          `[safety] swapExactInLocal: no valid quote for ${metaIn.symbol}→${metaOut.symbol} — aborting`,
+      // Defense in depth: this round's quote is used within the same
+      // round with no allowance-wait gap, but keep the check for
+      // consistency and in case a future change introduces one.
+      if (isQuoteStale(quotedAt)) {
+        throw new Error(
+          `[safety] swapExactInLocal: quote is stale (age > ${LOCAL_QUOTE_MAX_AGE_MS}ms) — refusing to trade on it`,
         );
       }
 
-      const { assertMaxPriceImpact } = await import('./priceImpact.js');
-      await assertMaxPriceImpact({
+      const { checkPriceImpact } = await import('./priceImpact.js');
+      const impact = await checkPriceImpact({
         chainId,
         tokenIn,
         tokenOut,
         amountIn,
         amountOut: estimatedOut,
       });
+      lastImpactBps = impact.impactBps;
+      if (!impact.ok) {
+        throw new Error(impact.reason ?? 'Price impact too high');
+      }
 
       // Single, non-degrading minOut from this round's fresh quote.
       const minLevels = [
@@ -1169,43 +1458,47 @@ async function swapExactInLocal(
           context: `swapExactInLocal ${metaIn.symbol}→${metaOut.symbol}`,
         }),
       ];
+      lastMinOut = minLevels[0]!;
 
       let lastErr = '';
       for (const minOut of minLevels) {
         try {
           if (route.kind === 'multi') {
             if (isPcs) {
+              const pcsMultiArgs = [
+                {
+                  path: route.path,
+                  recipient: owner,
+                  deadline,
+                  amountIn,
+                  amountOutMinimum: minOut,
+                },
+              ] as const;
               await client.simulateContract({
                 address: router,
                 abi: pcsSwapRouterAbi,
                 functionName: 'exactInput',
-                args: [
-                  {
-                    path: route.path,
-                    recipient: owner,
-                    deadline,
-                    amountIn,
-                    amountOutMinimum: minOut,
-                  },
-                ],
+                args: pcsMultiArgs,
                 account: owner,
+              });
+              const gasPcsMulti = await estimateWriteGas({
+                client,
+                address: router,
+                abi: pcsSwapRouterAbi,
+                functionName: 'exactInput',
+                args: pcsMultiArgs,
+                account: wallet.account!.address,
+                fallbackGas: 700_000n,
+                context: 'swapExactInLocal PCS multi',
               });
               const hash = await wallet.writeContract({
                 address: router,
                 abi: pcsSwapRouterAbi,
                 functionName: 'exactInput',
-                args: [
-                  {
-                    path: route.path,
-                    recipient: owner,
-                    deadline,
-                    amountIn,
-                    amountOutMinimum: minOut,
-                  },
-                ],
+                args: pcsMultiArgs,
                 account: wallet.account!,
                 chain: wallet.chain,
-                gas: 700_000n,
+                gas: gasPcsMulti,
               });
               const receipt = await client.waitForTransactionReceipt({ hash });
               if (receipt.status !== 'success') throw new Error(`swap reverted ${hash}`);
@@ -1215,35 +1508,39 @@ async function swapExactInLocal(
               );
               return { hash, txLink: txUrl(chainId, hash), amountIn };
             }
+            const uniMultiArgs = [
+              {
+                path: route.path,
+                recipient: owner,
+                amountIn,
+                amountOutMinimum: minOut,
+              },
+            ] as const;
             await client.simulateContract({
               address: router,
               abi: swapRouter02Abi,
               functionName: 'exactInput',
-              args: [
-                {
-                  path: route.path,
-                  recipient: owner,
-                  amountIn,
-                  amountOutMinimum: minOut,
-                },
-              ],
+              args: uniMultiArgs,
               account: owner,
+            });
+            const gasUniMulti = await estimateWriteGas({
+              client,
+              address: router,
+              abi: swapRouter02Abi,
+              functionName: 'exactInput',
+              args: uniMultiArgs,
+              account: wallet.account!.address,
+              fallbackGas: 700_000n,
+              context: 'swapExactInLocal multi',
             });
             const hash = await wallet.writeContract({
               address: router,
               abi: swapRouter02Abi,
               functionName: 'exactInput',
-              args: [
-                {
-                  path: route.path,
-                  recipient: owner,
-                  amountIn,
-                  amountOutMinimum: minOut,
-                },
-              ],
+              args: uniMultiArgs,
               account: wallet.account!,
               chain: wallet.chain,
-              gas: 700_000n,
+              gas: gasUniMulti,
             });
             const receipt = await client.waitForTransactionReceipt({ hash });
             if (receipt.status !== 'success') throw new Error(`swap reverted ${hash}`);
@@ -1255,43 +1552,43 @@ async function swapExactInLocal(
           }
 
           if (isPcs) {
+            const pcsSingleArgs = [
+              {
+                tokenIn,
+                tokenOut,
+                fee: route.fee,
+                recipient: owner,
+                deadline,
+                amountIn,
+                amountOutMinimum: minOut,
+                sqrtPriceLimitX96: 0n,
+              },
+            ] as const;
             await client.simulateContract({
               address: router,
               abi: pcsSwapRouterAbi,
               functionName: 'exactInputSingle',
-              args: [
-                {
-                  tokenIn,
-                  tokenOut,
-                  fee: route.fee,
-                  recipient: owner,
-                  deadline,
-                  amountIn,
-                  amountOutMinimum: minOut,
-                  sqrtPriceLimitX96: 0n,
-                },
-              ],
+              args: pcsSingleArgs,
               account: owner,
+            });
+            const gasPcsSingle = await estimateWriteGas({
+              client,
+              address: router,
+              abi: pcsSwapRouterAbi,
+              functionName: 'exactInputSingle',
+              args: pcsSingleArgs,
+              account: wallet.account!.address,
+              fallbackGas: 450_000n,
+              context: 'swapExactInLocal PCS single',
             });
             const hash = await wallet.writeContract({
               address: router,
               abi: pcsSwapRouterAbi,
               functionName: 'exactInputSingle',
-              args: [
-                {
-                  tokenIn,
-                  tokenOut,
-                  fee: route.fee,
-                  recipient: owner,
-                  deadline,
-                  amountIn,
-                  amountOutMinimum: minOut,
-                  sqrtPriceLimitX96: 0n,
-                },
-              ],
+              args: pcsSingleArgs,
               account: wallet.account!,
               chain: wallet.chain,
-              gas: 450_000n,
+              gas: gasPcsSingle,
             });
             const receipt = await client.waitForTransactionReceipt({ hash });
             if (receipt.status !== 'success') throw new Error(`swap reverted ${hash}`);
@@ -1301,41 +1598,42 @@ async function swapExactInLocal(
             return { hash, txLink: txUrl(chainId, hash), amountIn };
           }
 
+          const uniSingleArgs = [
+            {
+              tokenIn,
+              tokenOut,
+              fee: route.fee,
+              recipient: owner,
+              amountIn,
+              amountOutMinimum: minOut,
+              sqrtPriceLimitX96: 0n,
+            },
+          ] as const;
           await client.simulateContract({
             address: router,
             abi: swapRouter02Abi,
             functionName: 'exactInputSingle',
-            args: [
-              {
-                tokenIn,
-                tokenOut,
-                fee: route.fee,
-                recipient: owner,
-                amountIn,
-                amountOutMinimum: minOut,
-                sqrtPriceLimitX96: 0n,
-              },
-            ],
+            args: uniSingleArgs,
             account: owner,
+          });
+          const gasUniSingle = await estimateWriteGas({
+            client,
+            address: router,
+            abi: swapRouter02Abi,
+            functionName: 'exactInputSingle',
+            args: uniSingleArgs,
+            account: wallet.account!.address,
+            fallbackGas: 450_000n,
+            context: 'swapExactInLocal single',
           });
           const hash = await wallet.writeContract({
             address: router,
             abi: swapRouter02Abi,
             functionName: 'exactInputSingle',
-            args: [
-              {
-                tokenIn,
-                tokenOut,
-                fee: route.fee,
-                recipient: owner,
-                amountIn,
-                amountOutMinimum: minOut,
-                sqrtPriceLimitX96: 0n,
-              },
-            ],
+            args: uniSingleArgs,
             account: wallet.account!,
             chain: wallet.chain,
-            gas: 450_000n,
+            gas: gasUniSingle,
           });
           const receipt = await client.waitForTransactionReceipt({ hash });
           if (receipt.status !== 'success') throw new Error(`swap reverted ${hash}`);
@@ -1348,9 +1646,16 @@ async function swapExactInLocal(
         }
       }
       throw new Error(`swapExactIn local round ${round} failed: ${lastErr.slice(0, 200)}`);
-    },
-    { times: 3, backoffMs: 900, label: 'swapExactInLocal' },
-  );
+      },
+      { times: 3, backoffMs: 900, label: 'swapExactInLocal' },
+    );
+    await recordTelemetry({ ok: true, txHash: result.hash });
+    return result;
+  } catch (e) {
+    const errorMsg = e instanceof Error ? e.message : String(e);
+    await recordTelemetry({ ok: false, errorMsg });
+    throw e;
+  }
 }
 
 /**

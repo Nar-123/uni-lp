@@ -31,7 +31,8 @@ export const {
   V4PositionManager,
 } = v4Sdk;
 
-export const { Token, Percent, Ether } = sdkCore;
+export const { Token, Percent, Ether, CurrencyAmount } = sdkCore;
+export type { TickDataProvider } from '@uniswap/v3-sdk';
 
 /**
  * PancakeSwap V3 medium fee = 2500 (0.25%), tick spacing 50.

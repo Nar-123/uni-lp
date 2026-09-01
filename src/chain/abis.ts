@@ -161,6 +161,13 @@ export const poolAbi = [
       { name: 'initialized', type: 'bool' },
     ],
   },
+  {
+    type: 'function',
+    name: 'tickBitmap',
+    stateMutability: 'view',
+    inputs: [{ name: 'wordPosition', type: 'int16' }],
+    outputs: [{ type: 'uint256' }],
+  },
 ] as const;
 
 export const npmAbi = [

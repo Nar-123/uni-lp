@@ -13,6 +13,7 @@ import {
 } from '../config.js';
 import { erc20Abi, npmAbi } from './abis.js';
 import { getHotWalletAddress, getPublicClient, getWalletClient } from './clients.js';
+import { estimateWriteGas } from './gas.js';
 import { loadPool } from './pools.js';
 import { assertOutOfRange, computeSingleSidedRange } from './ticks.js';
 import {
@@ -455,6 +456,16 @@ export async function mintSingleSided(params: MintParamsWithProtocol): Promise<M
     );
   }
 
+  const gas = await estimateWriteGas({
+    client,
+    address: npm,
+    abi: npmAbi,
+    functionName: 'mint',
+    args: [mintArgs],
+    account: wallet.account!.address,
+    fallbackGas: 900_000n,
+    context: 'mint v3',
+  });
   const hash = await wallet.writeContract({
     address: npm,
     abi: npmAbi,
@@ -462,7 +473,7 @@ export async function mintSingleSided(params: MintParamsWithProtocol): Promise<M
     args: [mintArgs],
     account: wallet.account!,
     chain: wallet.chain,
-    gas: 900_000n,
+    gas,
   });
 
   const receipt = await client.waitForTransactionReceipt({ hash });
@@ -512,6 +523,30 @@ export async function mintSingleSided(params: MintParamsWithProtocol): Promise<M
         args: [recipient, bal - 1n],
       });
     }
+  }
+
+  // Gas telemetry (Phase 3 §17) — mint previously had none at all.
+  // Best-effort: never blocks/fails the already-successful mint.
+  try {
+    const { recordExecutionTelemetry } = await import('../db/index.js');
+    const { buildGasTelemetry } = await import('./gas.js');
+    const telemetryGas = await buildGasTelemetry(client, hash, gas);
+    recordExecutionTelemetry({
+      chainId,
+      opType: 'mint-v3',
+      dex,
+      slippageBpsUsed: 0,
+      quoteSource: 'v3-mint-IncreaseLiquidity-event',
+      legs: [
+        { token: pool.token0.address, estimatedRaw: amount0Desired.toString(), minRaw: '0', actualRaw: amount0.toString() },
+        { token: pool.token1.address, estimatedRaw: amount1Desired.toString(), minRaw: '0', actualRaw: amount1.toString() },
+      ],
+      txHash: hash,
+      ok: true,
+      gas: telemetryGas,
+    });
+  } catch {
+    /* telemetry is best-effort only */
   }
 
   return {

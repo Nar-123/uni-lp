@@ -7,8 +7,34 @@ import {
   isSupportedChainId,
   type SupportedChainId,
 } from '../config.js';
+import { computeRealizedSlippageBps } from '../chain/safety.js';
+import type { MultiPositionMeta } from '../strategy/types.js';
 
 export type LedgerKind = 'deposit' | 'withdrawal' | 'fee_claim';
+
+/**
+ * Phase 3.5: Accounting metadata staged in the transaction journal before
+ * calling recordLedger(), so that a crash after tx success but before
+ * recordLedger() completes can be detected and recovered automatically.
+ *
+ * usd=null means the USD value was not available at staging time —
+ * recovery flags RECONCILIATION_REQUIRED rather than silently recording
+ * zero or a fabricated amount.
+ *
+ * feeSplitIsEstimated=true on fee_claim entries from a combined close
+ * where principal vs. fees could not be exactly separated from on-chain
+ * events (see Phase 3.5 audit §11).
+ */
+export type JournalAccountingMeta = {
+  kind: LedgerKind;
+  tokenId: string;
+  tokenAddress: string | null;
+  amountRaw: string | null;
+  amountHuman: number | null;
+  /** null = USD unknown at staging time — RECONCILIATION_REQUIRED on recovery */
+  usd: number | null;
+  feeSplitIsEstimated?: boolean;
+};
 
 export type DepositMode = 'auto' | 'wrapped' | 'stable';
 
@@ -110,6 +136,8 @@ type PositionRow = {
   /** Override defaults; null = use prefs */
   tp_percent?: number | null;
   sl_percent?: number | null;
+  /** Phase 4: which strategy opened this position. Absent = pre-Phase-4 / manual. */
+  strategy?: string;
 };
 
 type LedgerRow = {
@@ -123,7 +151,285 @@ type LedgerRow = {
   usd: number;
   tx_hash: string | null;
   created_at: number;
+  /** Phase 4: which strategy produced this ledger event. Absent = pre-Phase-4 / manual. */
+  strategy?: string;
 };
+
+export type ExecutionOpType =
+  | 'swap'
+  | 'close-v3'
+  | 'close-v4'
+  | 'mint-v3'
+  | 'mint-v4'
+  | 'claim-fees-v3'
+  | 'claim-fees-v4';
+
+export type ExecutionTelemetryLeg = {
+  token: string;
+  /** raw units (bigint as string) */
+  estimatedRaw: string;
+  minRaw: string;
+  /** null when the actual amount received couldn't be independently measured */
+  actualRaw: string | null;
+  /**
+   * bps worse (positive) / better (negative) actual was vs estimated, per
+   * computeRealizedSlippageBps — computed at record time, null when
+   * actualRaw is null. See safety.ts for the metric's exact definition.
+   */
+  realizedSlippageBps?: number | null;
+};
+
+/**
+ * Gas telemetry for one broadcast tx. All fields are null ("UNKNOWN"), never
+ * a fabricated 0, when the underlying value couldn't be measured (e.g. no
+ * receipt yet, RPC failure reading it back) — see buildGasTelemetry in
+ * chain/gas.ts.
+ */
+export type ExecutionTelemetryGas = {
+  /** padded gas limit actually sent with the tx (estimateWriteGas's output, or the bounded fallback if estimation failed) */
+  gasLimitSent: string | null;
+  /** gas units actually consumed, from the mined receipt */
+  gasUsed: string | null;
+  /** effective gas price paid (wei), from the mined receipt */
+  effectiveGasPriceWei: string | null;
+  /** actual total gas cost in wei = gasUsed * effectiveGasPriceWei */
+  actualGasCostWei: string | null;
+};
+
+type ExecutionTelemetryRow = {
+  id: number;
+  at: number;
+  chain_id: number;
+  op_type: ExecutionOpType;
+  dex?: string;
+  slippage_bps_used: number;
+  /** null when a price-impact estimate wasn't available/computed for this op */
+  price_impact_bps: number | null;
+  /** e.g. 'v3-pool-simulation' (quote.ts) — how the estimated/min amounts were derived */
+  quote_source?: string;
+  /** ms epoch the quote (feeding estimated/min) was computed */
+  quoted_at?: number;
+  /** human-readable route label, e.g. "UNI direct · fee 0.30%" */
+  route?: string;
+  legs: ExecutionTelemetryLeg[];
+  tx_hash: string | null;
+  ok: boolean;
+  error_msg?: string;
+  /** absent for older rows recorded before Phase 2 Part 3's gas telemetry */
+  gas?: ExecutionTelemetryGas | null;
+};
+
+/**
+ * Transaction recovery journal (Phase 2 Part 4).
+ *
+ * `CREATED`/`SIMULATED`/`GAS_ESTIMATED` are deliberately NOT persisted
+ * states — nothing has been broadcast yet at those points, so a crash
+ * there has nothing to recover (the caller simply restarts the operation
+ * from scratch). The journal only tracks the ambiguous window starting
+ * right before a real broadcast attempt, through to a definitively known
+ * outcome.
+ */
+export type TxJournalState =
+  /** written before the broadcast RPC call; pessimistic default */
+  | 'BROADCAST_UNKNOWN'
+  /** hash obtained, receipt not yet confirmed */
+  | 'SUBMITTED'
+  /** receipt confirms success */
+  | 'MINED_SUCCESS'
+  /** receipt confirms revert */
+  | 'MINED_REVERT'
+  /** terminal success — set once MINED_SUCCESS is observed (this bot does not track confirmation depth) */
+  | 'CONFIRMED'
+  /** nonce-based check proved this specific attempt's nonce was never consumed — safe to retry */
+  | 'NOT_SUBMITTED'
+  /** ambiguity could not be resolved within bounded recovery attempts — automated retry halted */
+  | 'RECOVERY_REQUIRED';
+
+/** States that block a new send for the same (chainId, wallet) and require startup recovery. */
+export const UNRESOLVED_TX_STATES: readonly TxJournalState[] = [
+  'BROADCAST_UNKNOWN',
+  'SUBMITTED',
+  'RECOVERY_REQUIRED',
+];
+
+type TxJournalRow = {
+  id: number;
+  chain_id: number;
+  /** wallet ADDRESS only — never a private key */
+  wallet: string;
+  nonce: number | null;
+  tx_hash: string | null;
+  /** short label, e.g. "writeContract:decreaseLiquidity" */
+  action: string;
+  state: TxJournalState;
+  created_at: number;
+  updated_at: number;
+  error_msg?: string;
+  /** Phase 3.5: ledger events to replay if process crashes before recordLedger() */
+  accounting_meta?: JournalAccountingMeta[];
+};
+
+export type TxJournalEntry = {
+  id: number;
+  chainId: number;
+  wallet: string;
+  nonce: number | null;
+  txHash: string | null;
+  action: string;
+  state: TxJournalState;
+  createdAt: number;
+  updatedAt: number;
+  errorMsg?: string;
+  /** Phase 3.5: staged accounting events for crash-recovery (see setJournalAccountingMeta) */
+  accountingMeta?: JournalAccountingMeta[];
+};
+
+/** Bound the JSON store's size — oldest TERMINAL rows are trimmed past this count; unresolved rows are never trimmed. */
+const MAX_TX_JOURNAL_ROWS = 2_000;
+
+function toTxJournalEntry(r: TxJournalRow): TxJournalEntry {
+  return {
+    id: r.id,
+    chainId: r.chain_id,
+    wallet: r.wallet,
+    nonce: r.nonce,
+    txHash: r.tx_hash,
+    action: r.action,
+    state: r.state,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    errorMsg: r.error_msg,
+    accountingMeta: r.accounting_meta,
+  };
+}
+
+/**
+ * Create a journal entry BEFORE the broadcast RPC call, so a crash right
+ * after this point (before the RPC responds) still leaves a durable record
+ * to recover from. Always starts in `BROADCAST_UNKNOWN` — the pessimistic
+ * default — since we haven't attempted the network call yet at this point.
+ */
+export function createTxJournalEntry(entry: {
+  chainId: number;
+  wallet: string;
+  nonce: number | null;
+  action: string;
+}): number {
+  const s = load();
+  if (!s.tx_journal) s.tx_journal = [];
+  if (s.nextTxJournalId == null) s.nextTxJournalId = 1;
+  const id = s.nextTxJournalId++;
+  const now = Date.now();
+  s.tx_journal.push({
+    id,
+    chain_id: entry.chainId,
+    wallet: entry.wallet,
+    nonce: entry.nonce,
+    tx_hash: null,
+    action: entry.action,
+    state: 'BROADCAST_UNKNOWN',
+    created_at: now,
+    updated_at: now,
+  });
+  persist();
+  return id;
+}
+
+export function updateTxJournalEntry(
+  id: number,
+  patch: Partial<Pick<TxJournalRow, 'state' | 'tx_hash' | 'nonce' | 'error_msg'>>,
+): void {
+  const s = load();
+  const row = (s.tx_journal ?? []).find((r) => r.id === id);
+  if (!row) return;
+  Object.assign(row, patch, { updated_at: Date.now() });
+  persist();
+  pruneTxJournal();
+}
+
+export function getTxJournalEntry(id: number): TxJournalEntry | undefined {
+  const s = load();
+  const row = (s.tx_journal ?? []).find((r) => r.id === id);
+  return row ? toTxJournalEntry(row) : undefined;
+}
+
+/** Unresolved entries — optionally filtered to one (chainId, wallet). */
+export function listUnresolvedTxJournal(filters: {
+  chainId?: number;
+  wallet?: string;
+} = {}): TxJournalEntry[] {
+  const s = load();
+  return (s.tx_journal ?? [])
+    .filter((r) => UNRESOLVED_TX_STATES.includes(r.state))
+    .filter((r) => filters.chainId == null || r.chain_id === filters.chainId)
+    .filter(
+      (r) =>
+        filters.wallet == null || r.wallet.toLowerCase() === filters.wallet.toLowerCase(),
+    )
+    .map(toTxJournalEntry);
+}
+
+export function listAllTxJournal(limit?: number): TxJournalEntry[] {
+  const s = load();
+  const rows = (s.tx_journal ?? []).map(toTxJournalEntry);
+  return limit != null ? rows.slice(Math.max(0, rows.length - limit)) : rows;
+}
+
+/** All CONFIRMED journal entries, optionally filtered to one chain. */
+export function listConfirmedTxJournal(chainId?: number): TxJournalEntry[] {
+  const s = load();
+  return (s.tx_journal ?? [])
+    .filter((r) => r.state === 'CONFIRMED')
+    .filter((r) => chainId == null || r.chain_id === chainId)
+    .map(toTxJournalEntry);
+}
+
+/**
+ * Phase 3.5: Attach accounting metadata to the journal entry identified
+ * by (chainId, txHash). Call this BEFORE recordLedger() so that a crash
+ * between tx success and recordLedger() leaves enough information for
+ * startup reconciliation to recreate the missing ledger event.
+ *
+ * Best-effort: returns false when the entry cannot be found (e.g. the
+ * journal was pruned or this tx bypassed journalledSend). Caller must
+ * call recordLedger() regardless of the return value.
+ */
+export function setJournalAccountingMeta(
+  chainId: SupportedChainId,
+  txHash: string,
+  meta: JournalAccountingMeta[],
+): boolean {
+  const s = load();
+  const lower = txHash.toLowerCase();
+  const row = (s.tx_journal ?? []).find(
+    (r) => r.chain_id === chainId && r.tx_hash?.toLowerCase() === lower,
+  );
+  if (!row) return false;
+  row.accounting_meta = meta;
+  persist();
+  return true;
+}
+
+/** Trim oldest TERMINAL rows past MAX_TX_JOURNAL_ROWS — never drops an unresolved row. */
+function pruneTxJournal(): void {
+  const s = load();
+  const rows = s.tx_journal;
+  if (!rows || rows.length <= MAX_TX_JOURNAL_ROWS) return;
+  let overflow = rows.length - MAX_TX_JOURNAL_ROWS;
+  const kept: TxJournalRow[] = [];
+  for (const r of rows) {
+    if (overflow > 0 && !UNRESOLVED_TX_STATES.includes(r.state)) {
+      overflow--;
+      continue;
+    }
+    kept.push(r);
+  }
+  s.tx_journal = kept;
+  persist();
+}
+
+/** Bound the JSON store's size — oldest rows are trimmed past this count. */
+const MAX_EXECUTION_TELEMETRY_ROWS = 5_000;
 
 type Store = {
   positions: PositionRow[];
@@ -137,6 +443,28 @@ type Store = {
    * These are skipped during v4 discovery to avoid re-scanning dead NFTs.
    */
   v4_empty_shells?: Record<string, string[]>;
+  /**
+   * Phase 2: per-execution record of slippage bound used vs estimated
+   * price impact vs actually realized output. Write-mostly telemetry for
+   * future data-driven slippage calibration — never read to gate a live
+   * trading decision.
+   */
+  execution_telemetry?: ExecutionTelemetryRow[];
+  nextTelemetryId?: number;
+  /**
+   * Phase 2 Part 4: journal of every local broadcast attempt, written
+   * before/at the point of broadcast so a process crash, RPC timeout, or
+   * restart can recover the true on-chain state instead of guessing. See
+   * chain/txRecovery.ts and PHASE2_PART4_AUDIT.md.
+   */
+  tx_journal?: TxJournalRow[];
+  nextTxJournalId?: number;
+  /**
+   * Phase 4: append-only historical entry metadata for MULTI-strategy
+   * positions, keyed by (chainId, tokenId). Never mutated after entry —
+   * used for auditability / the /multi report, not for trading decisions.
+   */
+  multi_position_meta?: MultiPositionMeta[];
 };
 
 let store: Store | null = null;
@@ -153,6 +481,9 @@ function load(): Store {
     persist();
   }
   if (!store.prefs) store.prefs = {};
+  if (!store.execution_telemetry) store.execution_telemetry = [];
+  if (!store.nextTelemetryId) store.nextTelemetryId = 1;
+  if (!store.multi_position_meta) store.multi_position_meta = [];
   return store;
 }
 
@@ -369,6 +700,17 @@ export function getDb(): Store {
   return load();
 }
 
+/**
+ * Test-only: drop the in-memory cached store so the next call to any db
+ * function re-reads from disk via `load()` — simulates a process
+ * restart's cold-load without spawning a child process. Not used by any
+ * production code path.
+ */
+export function __resetStoreForTests(): void {
+  store = null;
+  storePath = '';
+}
+
 export function recordOpenPosition(row: {
   chainId: SupportedChainId;
   tokenId: string;
@@ -380,6 +722,8 @@ export function recordOpenPosition(row: {
   tickUpper: number;
   protocol?: 'v3' | 'v4';
   dex?: DexId;
+  /** Phase 4: which strategy opened this position (e.g. 'multi'). Omit for manual mints. */
+  strategy?: string;
 }): void {
   const s = load();
   const protocol = row.protocol ?? 'v3';
@@ -418,6 +762,7 @@ export function recordOpenPosition(row: {
       closed_at: null,
       protocol,
       dex,
+      strategy: row.strategy,
     });
   }
   persist();
@@ -447,6 +792,33 @@ export function getPositionDex(
   return isDexId(row?.dex) ? row.dex : 'uniswap';
 }
 
+/**
+ * Deterministic identity for a ledger event: (chainId, txHash, kind). A
+ * single on-chain transaction produces at most one ledger row per kind in
+ * this codebase's existing call sites (e.g. one close tx yields at most
+ * one 'withdrawal' row and one 'fee_claim' row, never two of the same
+ * kind) — this is the "protocol-appropriate equivalent" of
+ * chainId+txHash+logIndex+eventType for a bot that doesn't track
+ * per-log granularity. `tokenId` is deliberately NOT part of the key:
+ * the same (chainId, txHash) can only ever belong to one token's
+ * transaction, so including it would just be redundant, not more precise.
+ */
+function ledgerEventKey(chainId: number, txHash: string, kind: LedgerKind): string {
+  return `${chainId}:${txHash.toLowerCase()}:${kind}`;
+}
+
+/**
+ * Record one ledger event — idempotent by (chainId, txHash, kind).
+ * Calling this twice for the same on-chain transaction (e.g. a caller
+ * accidentally re-processing a receipt, or a future reconciliation pass
+ * re-importing something already recorded) must NOT double-count in
+ * sumLedger()/computePositionPnl() — the duplicate call is a no-op
+ * (logged, not silently swallowed) rather than a second row.
+ *
+ * Entries with no txHash (none of this codebase's current call sites omit
+ * it, but the field is optional) have no identity to dedupe against and
+ * are always recorded — matches the pre-existing behavior for those.
+ */
 export function recordLedger(entry: {
   chainId: SupportedChainId;
   tokenId: string;
@@ -456,8 +828,23 @@ export function recordLedger(entry: {
   amountHuman?: number;
   usd: number;
   txHash?: string;
+  /** Phase 4: which strategy produced this event (e.g. 'multi'). Omit for manual ops. */
+  strategy?: string;
 }): void {
   const s = load();
+  if (entry.txHash) {
+    const key = ledgerEventKey(entry.chainId, entry.txHash, entry.kind);
+    const dup = s.ledger.find(
+      (r) => r.tx_hash != null && ledgerEventKey(r.chain_id, r.tx_hash, r.kind) === key,
+    );
+    if (dup) {
+      console.warn(
+        `[ledger] duplicate ${entry.kind} event ignored: chain=${entry.chainId} tx=${entry.txHash} ` +
+          `(already recorded as ledger id ${dup.id} at ${new Date(dup.created_at).toISOString()})`,
+      );
+      return;
+    }
+  }
   s.ledger.push({
     id: s.nextLedgerId++,
     chain_id: entry.chainId,
@@ -469,8 +856,113 @@ export function recordLedger(entry: {
     usd: entry.usd,
     tx_hash: entry.txHash ?? null,
     created_at: Date.now(),
+    strategy: entry.strategy,
   });
   persist();
+}
+
+/**
+ * Record one execution's slippage bound vs estimated price impact vs
+ * actually realized output. Best-effort, never throws — a telemetry
+ * write failure must not fail the trade it's describing.
+ */
+export function recordExecutionTelemetry(entry: {
+  chainId: SupportedChainId;
+  opType: ExecutionOpType;
+  dex?: string;
+  slippageBpsUsed: number;
+  priceImpactBps?: number | null;
+  quoteSource?: string;
+  quotedAt?: number;
+  route?: string;
+  legs: ExecutionTelemetryLeg[];
+  txHash?: string | null;
+  ok: boolean;
+  errorMsg?: string;
+  gas?: ExecutionTelemetryGas | null;
+}): void {
+  try {
+    const s = load();
+    const rows = s.execution_telemetry!;
+    const legsWithRealized = entry.legs.map((leg) => ({
+      ...leg,
+      realizedSlippageBps: computeRealizedSlippageBps(
+        BigInt(leg.estimatedRaw),
+        leg.actualRaw == null ? null : BigInt(leg.actualRaw),
+      ),
+    }));
+    rows.push({
+      id: s.nextTelemetryId!++,
+      at: Date.now(),
+      chain_id: entry.chainId,
+      op_type: entry.opType,
+      dex: entry.dex,
+      slippage_bps_used: entry.slippageBpsUsed,
+      price_impact_bps: entry.priceImpactBps ?? null,
+      quote_source: entry.quoteSource,
+      quoted_at: entry.quotedAt,
+      route: entry.route,
+      legs: legsWithRealized,
+      tx_hash: entry.txHash ?? null,
+      ok: entry.ok,
+      error_msg: entry.errorMsg,
+      gas: entry.gas ?? null,
+    });
+    if (rows.length > MAX_EXECUTION_TELEMETRY_ROWS) {
+      rows.splice(0, rows.length - MAX_EXECUTION_TELEMETRY_ROWS);
+    }
+    persist();
+  } catch (e) {
+    console.warn('[telemetry] record failed', e instanceof Error ? e.message : e);
+  }
+}
+
+export type ExecutionTelemetryEntry = {
+  id: number;
+  at: number;
+  chainId: number;
+  opType: ExecutionOpType;
+  dex?: string;
+  slippageBpsUsed: number;
+  priceImpactBps: number | null;
+  quoteSource?: string;
+  quotedAt?: number;
+  route?: string;
+  legs: ExecutionTelemetryLeg[];
+  txHash: string | null;
+  ok: boolean;
+  errorMsg?: string;
+  gas?: ExecutionTelemetryGas | null;
+};
+
+export function listExecutionTelemetry(filters: {
+  chainId?: SupportedChainId;
+  opType?: ExecutionOpType;
+  limit?: number;
+} = {}): ExecutionTelemetryEntry[] {
+  const s = load();
+  const rows = (s.execution_telemetry ?? [])
+    .filter((r) => filters.chainId == null || r.chain_id === filters.chainId)
+    .filter((r) => filters.opType == null || r.op_type === filters.opType)
+    .map((r) => ({
+      id: r.id,
+      at: r.at,
+      chainId: r.chain_id,
+      opType: r.op_type,
+      dex: r.dex,
+      slippageBpsUsed: r.slippage_bps_used,
+      priceImpactBps: r.price_impact_bps,
+      quoteSource: r.quote_source,
+      quotedAt: r.quoted_at,
+      route: r.route,
+      legs: r.legs,
+      txHash: r.tx_hash,
+      ok: r.ok,
+      errorMsg: r.error_msg,
+      gas: r.gas,
+    }));
+  const limit = filters.limit ?? rows.length;
+  return rows.slice(Math.max(0, rows.length - limit));
 }
 
 export function markClosed(chainId: SupportedChainId, tokenId: string): void {
@@ -606,6 +1098,7 @@ export function sumLedger(
 }
 
 export type LedgerEntry = {
+  id: number;
   chainId: number;
   tokenId: string;
   kind: LedgerKind;
@@ -615,6 +1108,7 @@ export type LedgerEntry = {
   usd: number;
   txHash: string | null;
   createdAt: number;
+  strategy?: string;
 };
 
 export function getLedgerEntries(
@@ -631,6 +1125,7 @@ export function getLedgerEntries(
       return true;
     })
     .map((l) => ({
+      id: l.id,
       chainId: l.chain_id,
       tokenId: l.token_id,
       kind: l.kind,
@@ -640,6 +1135,7 @@ export function getLedgerEntries(
       usd: l.usd,
       txHash: l.tx_hash,
       createdAt: l.created_at,
+      strategy: l.strategy,
     }));
 }
 
@@ -675,6 +1171,7 @@ export type TrackedPosition = {
   label: string | null;
   protocol: 'v3' | 'v4';
   dex: DexId;
+  strategy?: string;
 };
 
 function mapPositionRow(p: PositionRow): TrackedPosition {
@@ -693,6 +1190,7 @@ function mapPositionRow(p: PositionRow): TrackedPosition {
     label: p.label ?? null,
     protocol: (p.protocol === 'v4' ? 'v4' : 'v3') as 'v3' | 'v4',
     dex: isDexId(p.dex) ? p.dex : 'uniswap',
+    strategy: p.strategy,
   };
 }
 
@@ -822,4 +1320,40 @@ export function trackedNftCount(chainId: SupportedChainId): {
   ).length;
   const emptyShells = s.v4_empty_shells?.[key]?.length ?? 0;
   return { open, emptyShells, total: open + emptyShells };
+}
+
+// ── Phase 4: MULTI strategy position metadata ──
+
+/**
+ * Persist historical entry metadata for a MULTI-opened position. Append-only:
+ * if metadata already exists for (chainId, tokenId), it is left untouched
+ * (never overwrite historical entry data) and this call is a no-op.
+ */
+export function recordMultiPositionMeta(meta: MultiPositionMeta): void {
+  const s = load();
+  if (!s.multi_position_meta) s.multi_position_meta = [];
+  const exists = s.multi_position_meta.some(
+    (m) => m.chainId === meta.chainId && m.tokenId === meta.tokenId,
+  );
+  if (exists) return;
+  s.multi_position_meta.push(meta);
+  persist();
+}
+
+export function getMultiPositionMeta(
+  chainId: number,
+  tokenId: string,
+): MultiPositionMeta | undefined {
+  const s = load();
+  return (s.multi_position_meta ?? []).find(
+    (m) => m.chainId === chainId && m.tokenId === tokenId,
+  );
+}
+
+/** Open positions, optionally filtered to one chain — used by MULTI risk gates. */
+export function listOpenPositions(chainId?: number): TrackedPosition[] {
+  const s = load();
+  return s.positions
+    .filter((p) => p.status === 'open' && (chainId == null || p.chain_id === chainId))
+    .map(mapPositionRow);
 }

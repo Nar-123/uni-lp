@@ -89,9 +89,23 @@ import {
   listTpSlEnrolledPositions,
   parseWidthPercent,
   parseMinTvlUsd,
+  setJournalAccountingMeta,
+  type JournalAccountingMeta,
 } from '../db/index.js';
 import { computePositionPnl, portfolioSummary, buildPositionHistory } from '../pnl/compute.js';
 import { renderPnlCard } from '../pnl/card.js';
+import { reconcileAccounting, recoverMissingLedger, formatReconciliationReport } from '../pnl/reconcile.js';
+import {
+  loadMultiConfig,
+  validateMultiConfig,
+  runMultiStrategy,
+  executeTradeIntent,
+  type MultiConfig,
+  type MultiStrategyRun,
+  type TradeIntent,
+  type MultiCandidate,
+  type RejectedCandidate,
+} from '../strategy/index.js';
 import type { Address } from 'viem';
 
 /** Confirm-mint keyboard: refresh recomputes range + spot from live pool tick. */
@@ -520,9 +534,24 @@ export function createBot(): Bot {
         tickSpacing: s.createV4TickSpacing,
       });
 
-      const depMeta = await getTokenMeta(s.chainId, deposit);
-      const depHuman = humanToFloat(result.depositAmount, depMeta.decimals);
-      const depUsd = ((await getTokenPriceUsd(s.chainId, deposit)) ?? 0) * depHuman;
+      // ACTUAL deposited capital — see the matching comment at the other
+      // recordLedger('deposit') call site above (PHASE3_ACCOUNTING_AUDIT.md
+      // "Deposit accounting").
+      const [meta0, meta1] = await Promise.all([
+        getTokenMeta(s.chainId, result.token0),
+        getTokenMeta(s.chainId, result.token1),
+      ]);
+      const [p0, p1] = await Promise.all([
+        getTokenPriceUsd(s.chainId, result.token0),
+        getTokenPriceUsd(s.chainId, result.token1),
+      ]);
+      const a0human = humanToFloat(result.amount0, meta0.decimals);
+      const a1human = humanToFloat(result.amount1, meta1.decimals);
+      const depUsd = a0human * (p0 ?? 0) + a1human * (p1 ?? 0);
+      const depositIsToken0 = result.token0.toLowerCase() === deposit.toLowerCase();
+      const depositRaw = depositIsToken0 ? result.amount0 : result.amount1;
+      const depHuman = depositIsToken0 ? a0human : a1human;
+      const depMeta = depositIsToken0 ? meta0 : meta1;
 
       recordOpenPosition({
         chainId: s.chainId,
@@ -536,19 +565,27 @@ export function createBot(): Bot {
         protocol: 'v4',
         dex: 'uniswap',
       });
+      // Stage accounting metadata in the journal BEFORE recordLedger() so
+      // that a crash between this point and the write below can be recovered
+      // automatically on the next startup (Phase 3.5).
+      setJournalAccountingMeta(s.chainId, result.hash, [{
+        kind: 'deposit',
+        tokenId: result.tokenId.toString(),
+        tokenAddress: deposit,
+        amountRaw: depositRaw.toString(),
+        amountHuman: depHuman,
+        usd: depUsd,
+      }]);
       recordLedger({
         chainId: s.chainId,
         tokenId: result.tokenId.toString(),
         kind: 'deposit',
         tokenAddress: deposit,
-        amountRaw: result.depositAmount.toString(),
+        amountRaw: depositRaw.toString(),
         amountHuman: depHuman,
         usd: depUsd,
         txHash: result.hash,
       });
-
-      const meta0 = await getTokenMeta(s.chainId, result.token0);
-      const meta1 = await getTokenMeta(s.chainId, result.token1);
       const core = new Set(['WETH', 'WBNB', 'USDC', 'USDG', 'USDT', 'ETH', 'BNB']);
       const name = !core.has(meta0.symbol.toUpperCase())
         ? meta0.symbol
@@ -584,7 +621,7 @@ export function createBot(): Bot {
         `✅ Created v4 pool + minted **${name} #${result.tokenId}**\n` +
           `Fee ${(feeUsed / 10_000).toFixed(feeUsed % 100 === 0 ? 2 : 3)}% · init ~1% below market\n` +
           `Range: ${compact}\n` +
-          `Deposited ~${formatUnits(result.depositAmount, depMeta.decimals)} ${depMeta.symbol} (${formatUsd(depUsd)})\n` +
+          `Deposited ~${formatUnits(depositRaw, depMeta.decimals)} ${depMeta.symbol} (${formatUsd(depUsd)})\n` +
           `mint: ${result.txLink}\n` +
           `${uniLink}`,
         { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } },
@@ -1615,9 +1652,74 @@ export function createBot(): Bot {
     await handleGenerate(ctx);
   });
 
+  // Phase 3.5: Accounting reconciliation check + auto-recovery.
+  // Only authorized users may invoke this. Does NOT expose private keys
+  // or sensitive wallet data — shows only txHash prefixes, chainIds, and
+  // event kinds.
+  bot.command('reconcile', async (ctx) => {
+    if (!(await requireAuth(ctx))) return;
+    try {
+      await ctx.reply('Running accounting reconciliation…');
+      const recovery = recoverMissingLedger();
+      const check = reconcileAccounting();
+      const text = formatReconciliationReport(recovery, check);
+      await ctx.reply(text);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await ctx.reply(`Reconciliation error: ${msg.slice(0, 500)}`);
+    }
+  });
+
   bot.command('tp', async (ctx) => {
     if (!(await requireAuth(ctx))) return;
     await handleTp(ctx);
+  });
+
+  // ── Phase 4: /multi — MULTI strategy dry-run report + execute ──────────
+  // MULTI never bypasses the existing execution pipeline: this handler only
+  // calls runMultiStrategy()/executeTradeIntent(), which route through
+  // mintSingleSided() exactly like a manual mint.
+  bot.command('multi', async (ctx) => {
+    if (!(await requireAuth(ctx))) return;
+    await ctx.reply('Scanning GMGN 6h trending for MULTI candidates…');
+    await runMultiDryRunReport(ctx, false);
+  });
+
+  bot.callbackQuery('multi:refresh', async (ctx) => {
+    if (!(await requireAuth(ctx))) return;
+    await ctx.answerCallbackQuery({ text: 'Refreshing…' });
+    await runMultiDryRunReport(ctx, true);
+  });
+
+  bot.callbackQuery(/^multi:exec:(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+    if (!(await requireAuth(ctx))) return;
+    const token = ctx.match![1];
+    const sess = getSession(ctx.from!.id);
+    const run = sess.multiRun;
+    const intent = run?.intents.find((i) => i.token.toLowerCase() === token.toLowerCase());
+    const candidate = run?.candidates.find((c) => c.address.toLowerCase() === token.toLowerCase());
+    if (!run || !intent || !candidate) {
+      await ctx.answerCallbackQuery({ text: 'Stale — run /multi again' });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: 'Executing…' });
+    try {
+      const config = loadMultiConfig(run.chainId);
+      const prefs = getUserPrefs(ctx.from!.id);
+      const outcome = await executeTradeIntent({ intent, candidate, config, prefs });
+      if ('skipped' in outcome) {
+        await ctx.reply(`⛔ Execution blocked: ${outcome.reason}`);
+      } else {
+        await ctx.reply(
+          `✅ MULTI entry opened — ${candidate.symbol}\n` +
+            `tokenId=${outcome.tokenId}\n` +
+            `tx: ${txUrl(run.chainId, outcome.txHash)}`,
+        );
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await ctx.reply(`Execution error:\n${msg.slice(0, 400)}`);
+    }
   });
 
   bot.command('close', async (ctx) => {
@@ -2078,10 +2180,27 @@ export function createBot(): Bot {
 
       // On-chain mint succeeded — never report "Mint failed" for post-mint bookkeeping.
       try {
-        const depMeta = await getTokenMeta(s.chainId, s.depositToken);
-        const depHuman = humanToFloat(result.depositAmount, depMeta.decimals);
-        const depUsd =
-          ((await getTokenPriceUsd(s.chainId, s.depositToken)) ?? 0) * depHuman;
+        // ACTUAL deposited capital: result.amount0/amount1 is the real
+        // on-chain amount pulled into the position (v3: decoded from the
+        // mint's IncreaseLiquidity event; v4: re-derived from the minted
+        // position's live liquidity) — not the pre-mint offered ceiling
+        // (result.depositAmount), which can exceed what was actually
+        // consumed. See PHASE3_ACCOUNTING_AUDIT.md "Deposit accounting".
+        const [meta0, meta1] = await Promise.all([
+          getTokenMeta(s.chainId, result.token0),
+          getTokenMeta(s.chainId, result.token1),
+        ]);
+        const [p0, p1] = await Promise.all([
+          getTokenPriceUsd(s.chainId, result.token0),
+          getTokenPriceUsd(s.chainId, result.token1),
+        ]);
+        const a0human = humanToFloat(result.amount0, meta0.decimals);
+        const a1human = humanToFloat(result.amount1, meta1.decimals);
+        const depUsd = a0human * (p0 ?? 0) + a1human * (p1 ?? 0);
+        const depositIsToken0 = result.token0.toLowerCase() === s.depositToken.toLowerCase();
+        const depositRaw = depositIsToken0 ? result.amount0 : result.amount1;
+        const depHuman = depositIsToken0 ? a0human : a1human;
+        const depMeta = depositIsToken0 ? meta0 : meta1;
 
         recordOpenPosition({
           chainId: s.chainId,
@@ -2095,12 +2214,21 @@ export function createBot(): Bot {
           protocol: result.protocol ?? selected.protocol ?? 'v3',
           dex: result.dex ?? mintDex,
         });
+        // Stage accounting metadata in the journal BEFORE recordLedger() (Phase 3.5).
+        setJournalAccountingMeta(s.chainId, result.hash, [{
+          kind: 'deposit',
+          tokenId: result.tokenId.toString(),
+          tokenAddress: s.depositToken,
+          amountRaw: depositRaw.toString(),
+          amountHuman: depHuman,
+          usd: depUsd,
+        }]);
         recordLedger({
           chainId: s.chainId,
           tokenId: result.tokenId.toString(),
           kind: 'deposit',
           tokenAddress: s.depositToken,
-          amountRaw: result.depositAmount.toString(),
+          amountRaw: depositRaw.toString(),
           amountHuman: depHuman,
           usd: depUsd,
           txHash: result.hash,
@@ -2114,8 +2242,6 @@ export function createBot(): Bot {
             `wrap: ${txUrl(s.chainId, result.wrap.hash)}\n`
           : '';
 
-        const meta0 = await getTokenMeta(s.chainId, result.token0);
-        const meta1 = await getTokenMeta(s.chainId, result.token1);
         const core = new Set(['WETH', 'WBNB', 'USDC', 'USDG', 'USDT', 'ETH', 'BNB']);
         const name = !core.has(meta0.symbol.toUpperCase())
           ? meta0.symbol
@@ -2148,7 +2274,7 @@ export function createBot(): Bot {
             prepBlock +
             wrapLine +
             `Range: ${compact}\n` +
-            `Deposited ~${formatUnits(result.depositAmount, depMeta.decimals)} ${depMeta.symbol} (${formatUsd(depUsd)})\n` +
+            `Deposited ~${formatUnits(depositRaw, depMeta.decimals)} ${depMeta.symbol} (${formatUsd(depUsd)})\n` +
             `mint: ${result.txLink}\n` +
             `${uniLink}`,
           { link_preview_options: { is_disabled: true } },
@@ -2310,6 +2436,15 @@ export function createBot(): Bot {
       await ctx.reply(`⏳ Claiming fees on #${tokenId} [${venue}]…`);
       const result = await claimFees(s.chainId, tokenId, protocol, dex);
       if (result.feesUsd > 0 || result.amount0Human > 0 || result.amount1Human > 0) {
+        // Stage accounting metadata in the journal BEFORE recordLedger() (Phase 3.5).
+        setJournalAccountingMeta(s.chainId, result.hash, [{
+          kind: 'fee_claim',
+          tokenId: tokenId.toString(),
+          tokenAddress: null,
+          amountRaw: null,
+          amountHuman: result.amount0Human + result.amount1Human,
+          usd: result.feesUsd,
+        }]);
         recordLedger({
           chainId: s.chainId,
           tokenId: tokenId.toString(),
@@ -3854,6 +3989,33 @@ async function executeClosePosition(
         `(delta-based, fees included)`,
     );
 
+    // Stage accounting metadata in the journal BEFORE recordLedger() so
+    // that a crash between this point and the ledger writes below can be
+    // recovered automatically on the next startup (Phase 3.5).
+    // Both withdrawal and fee_claim are staged atomically in one call.
+    const closeMeta: JournalAccountingMeta[] = [
+      {
+        kind: 'withdrawal',
+        tokenId: tokenId.toString(),
+        tokenAddress: null,
+        amountRaw: null,
+        amountHuman: result.amount0Human + result.amount1Human,
+        usd: result.withdrawalUsd - result.feesPortionUsd,
+      },
+    ];
+    if (result.feesPortionUsd > 0) {
+      closeMeta.push({
+        kind: 'fee_claim',
+        tokenId: tokenId.toString(),
+        tokenAddress: null,
+        amountRaw: null,
+        amountHuman: null,
+        usd: result.feesPortionUsd,
+        feeSplitIsEstimated: result.feeSplitIsEstimated,
+      });
+    }
+    setJournalAccountingMeta(chainId, result.hash, closeMeta);
+
     recordLedger({
       chainId,
       tokenId: tokenId.toString(),
@@ -5208,7 +5370,29 @@ async function handlePnl(ctx: Context): Promise<void> {
       live += p.valueUsd;
       unclaimed += p.unclaimedFeesUsd;
     }
-    await ctx.reply(await portfolioSummary(s.chainId, live, unclaimed));
+    // Aggregate known gas cost across positions — best-effort, never
+    // fabricated: a position with no matchable telemetry contributes
+    // "unknown" rather than 0, and the portfolio total is marked partial.
+    let gasTotalUsd = 0;
+    let anyGasKnown = false;
+    let allGasComplete = true;
+    for (const p of positions) {
+      const pnl = await computePositionPnl(s.chainId, p.tokenId, p);
+      if (pnl.gasCostUsd != null) {
+        gasTotalUsd += pnl.gasCostUsd;
+        anyGasKnown = true;
+      }
+      if (!pnl.gasCostComplete) allGasComplete = false;
+    }
+    await ctx.reply(
+      await portfolioSummary(
+        s.chainId,
+        live,
+        unclaimed,
+        anyGasKnown ? gasTotalUsd : null,
+        allGasComplete,
+      ),
+    );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     await ctx.reply(`PnL failed: ${msg}`);
@@ -5633,6 +5817,109 @@ async function executeUnwrap(
       `tx: ${txUrl(chainId, r.hash)}`,
     { link_preview_options: { is_disabled: true } },
   );
+}
+
+// ── MULTI strategy report + execute ─────────────────────────────────────────
+
+function formatMultiCandidateLine(intent: TradeIntent, candidate?: MultiCandidate): string {
+  const label = candidate ? candidate.symbol : intent.token.slice(0, 10);
+  const mc = candidate?.marketCapUsd != null ? formatUsd(candidate.marketCapUsd) : 'UNKNOWN';
+  const age = candidate?.ageHours != null ? `${candidate.ageHours.toFixed(1)}h` : 'UNKNOWN';
+  const vol = candidate?.volume6hUsd != null ? formatUsd(candidate.volume6hUsd) : 'UNKNOWN';
+  return (
+    `• ${label} — MC ${mc} · age ${age} · vol6h ${vol}\n` +
+    `  pool ${String(intent.pool.poolAddress).slice(0, 10)}… fee=${intent.fee}bps · candScore=${intent.candidateScore.toFixed(3)} poolScore=${intent.poolScore.toFixed(3)}\n` +
+    `  ${intent.reason}`
+  );
+}
+
+function formatMultiRejectedLine(r: RejectedCandidate): string {
+  const mc = r.marketCapUsd != null ? formatUsd(r.marketCapUsd) : 'UNKNOWN';
+  return `• ${r.symbol || r.address.slice(0, 10)} — ${r.rejectedReason} (MC ${mc})`;
+}
+
+function formatMultiReport(run: MultiStrategyRun, config: MultiConfig): string {
+  const header =
+    `📊 MULTI CANDIDATES — ${run.dryRun ? 'DRY RUN (no tx)' : 'LIVE'}\n` +
+    `chain=${CHAINS[run.chainId].name} · interval=6h · minMC=$${config.minMarketCapUsd.toLocaleString()} · ` +
+    `minAge=${config.minTokenAgeHours}h · topN=${config.topN} · usdg=${config.usdgAddress}`;
+
+  const passedLines = run.intents.length
+    ? run.intents
+        .map((intent) =>
+          formatMultiCandidateLine(
+            intent,
+            run.candidates.find((c) => c.address.toLowerCase() === intent.token.toLowerCase()),
+          ),
+        )
+        .join('\n')
+    : '(none passed all filters + risk gate)';
+
+  const rejectedTop = run.rejected.slice(0, 15);
+  const rejectedLines = rejectedTop.length
+    ? rejectedTop.map(formatMultiRejectedLine).join('\n')
+    : '(none rejected)';
+  const rejectedMore =
+    run.rejected.length > rejectedTop.length
+      ? `\n…and ${run.rejected.length - rejectedTop.length} more rejected`
+      : '';
+
+  return (
+    `${header}\n\n` +
+    `✅ ELIGIBLE (${run.intents.length}):\n${passedLines}\n\n` +
+    `❌ REJECTED (${run.rejected.length}):\n${rejectedLines}${rejectedMore}`
+  );
+}
+
+function multiKeyboard(run: MultiStrategyRun): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  for (const intent of run.intents) {
+    const c = run.candidates.find((x) => x.address.toLowerCase() === intent.token.toLowerCase());
+    const label = c ? `🚀 Execute ${c.symbol}` : `🚀 Execute ${intent.token.slice(0, 8)}`;
+    kb.text(label.slice(0, 60), `multi:exec:${intent.token}`).row();
+  }
+  kb.text('🔄 Refresh', 'multi:refresh');
+  return kb;
+}
+
+/** Runs a MULTI dry-run scan, stashes the result on the user's session (for
+ * the Execute buttons), and replies/edits with the candidate report. */
+async function runMultiDryRunReport(ctx: Context, edit: boolean): Promise<void> {
+  const config = loadMultiConfig();
+  const validation = validateMultiConfig(config);
+  if (!config.enabled || !validation.valid) {
+    const text = `⛔ MULTI DISABLED: ${config.disabledReason ?? validation.reason ?? 'invalid config'}`;
+    if (edit) {
+      try {
+        await ctx.editMessageText(text);
+        return;
+      } catch {
+        /* fall through to reply */
+      }
+    }
+    await ctx.reply(text);
+    return;
+  }
+
+  try {
+    const prefs = getUserPrefs(ctx.from!.id);
+    const run = await runMultiStrategy(config, { dryRun: true, prefs });
+    getSession(ctx.from!.id).multiRun = run;
+    const text = formatMultiReport(run, config);
+    const kb = multiKeyboard(run);
+    if (edit) {
+      try {
+        await ctx.editMessageText(text, { reply_markup: kb });
+        return;
+      } catch {
+        /* message unchanged or too old to edit — fall through to reply */
+      }
+    }
+    await ctx.reply(text, { reply_markup: kb });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await ctx.reply(`MULTI scan failed:\n${msg.slice(0, 400)}`);
+  }
 }
 
 // ── Screener + mint helpers ────────────────────────────────────────────────
