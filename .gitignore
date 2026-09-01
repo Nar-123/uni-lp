@@ -1,0 +1,23 @@
+# Dependencies & build
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Secrets & local runtime state (NEVER commit)
+.env
+.env.local
+.env.*.local
+data/**
+!data/.gitkeep
+
+# OS / editor
+.DS_Store
+*.log
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Optional local overrides
+WALLET_PATH
+*.pem

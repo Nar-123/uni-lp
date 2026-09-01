@@ -1,0 +1,41 @@
+{
+  "name": "lp-uniswap",
+  "version": "1.0.0",
+  "description": "Telegram bot for Uniswap v3/v4 + PancakeSwap V3 single-sided LP on Robinhood, BSC, and Base",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "keywords": [
+    "uniswap",
+    "pancakeswap",
+    "v3",
+    "telegram",
+    "lp",
+    "robinhood",
+    "bsc",
+    "base"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@uniswap/sdk-core": "^7.7.2",
+    "@uniswap/v3-sdk": "^3.25.2",
+    "@uniswap/v4-sdk": "^2.3.0",
+    "dotenv": "^16.5.0",
+    "ethers": "^5.7.2",
+    "grammy": "^1.36.1",
+    "jsbi": "^3.2.5",
+    "sharp": "^0.35.3",
+    "viem": "^2.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}
