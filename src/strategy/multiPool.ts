@@ -5,16 +5,24 @@ import type { MultiCandidate, MultiPoolCandidate } from './types.js';
 
 export type PoolFetcher = typeof listPoolsForToken;
 
-/** Only these fee tiers are ever scored — never manufactured/substituted (spec §15). */
-const PREFERRED_FEE_TIERS = [500, 400, 300];
+/**
+ * Only these fee tiers are ever scored — never manufactured/substituted (spec §15).
+ * Units match the on-chain v3 `fee()` convention used everywhere else in this
+ * codebase (hundredths of a bip; fee/10000 = percent — see chain/pools.ts
+ * feeLabel). 5% = 50000, 4% = 40000, 3% = 30000. These are NOT the same as
+ * config.ts's default-strategy FEE_TIERS ([100, 500, 3000, 10000]) — MULTI
+ * intentionally prefers higher fee tiers for meme/volatile pairs and only
+ * ever selects one that is actually listed on-chain for the pair.
+ */
+const PREFERRED_FEE_TIERS = [50_000, 40_000, 30_000];
 const TVL_REFERENCE_USD = 100_000;
 const VOLUME_REFERENCE_USD = 50_000;
 const VOLUME_TVL_RATIO_REFERENCE = 0.5;
 
 function feeScoreFor(fee: number | null): number {
-  if (fee === 500) return 1.0;
-  if (fee === 400) return 0.75;
-  if (fee === 300) return 0.5;
+  if (fee === 50_000) return 1.0;
+  if (fee === 40_000) return 0.75;
+  if (fee === 30_000) return 0.5;
   return 0;
 }
 

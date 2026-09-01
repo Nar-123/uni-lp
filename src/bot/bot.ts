@@ -98,6 +98,7 @@ import { reconcileAccounting, recoverMissingLedger, formatReconciliationReport }
 import {
   loadMultiConfig,
   validateMultiConfig,
+  getActiveStrategyName,
   runMultiStrategy,
   executeTradeIntent,
   type MultiConfig,
@@ -1679,20 +1680,38 @@ export function createBot(): Bot {
   // MULTI never bypasses the existing execution pipeline: this handler only
   // calls runMultiStrategy()/executeTradeIntent(), which route through
   // mintSingleSided() exactly like a manual mint.
+  //
+  // Strategy isolation (spec §9): being an authorized Telegram user is not
+  // by itself "explicit selection" of MULTI — the deployment operator must
+  // also opt in via STRATEGY=multi. Without it, /multi is inert regardless
+  // of how valid the rest of the MULTI config is, and the default strategy
+  // is completely unaffected either way.
   bot.command('multi', async (ctx) => {
     if (!(await requireAuth(ctx))) return;
+    if (getActiveStrategyName() !== 'multi') {
+      await ctx.reply('⛔ MULTI is not active on this bot (set STRATEGY=multi to enable).');
+      return;
+    }
     await ctx.reply('Scanning GMGN 6h trending for MULTI candidates…');
     await runMultiDryRunReport(ctx, false);
   });
 
   bot.callbackQuery('multi:refresh', async (ctx) => {
     if (!(await requireAuth(ctx))) return;
+    if (getActiveStrategyName() !== 'multi') {
+      await ctx.answerCallbackQuery({ text: 'MULTI is not active (STRATEGY=multi required)' });
+      return;
+    }
     await ctx.answerCallbackQuery({ text: 'Refreshing…' });
     await runMultiDryRunReport(ctx, true);
   });
 
   bot.callbackQuery(/^multi:exec:(0x[a-fA-F0-9]{40})$/, async (ctx) => {
     if (!(await requireAuth(ctx))) return;
+    if (getActiveStrategyName() !== 'multi') {
+      await ctx.answerCallbackQuery({ text: 'MULTI is not active (STRATEGY=multi required)' });
+      return;
+    }
     const token = ctx.match![1];
     const sess = getSession(ctx.from!.id);
     const run = sess.multiRun;

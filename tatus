@@ -1,0 +1,87 @@
+warning: in the working copy of 'src/bot/bot.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/strategy/multiPool.ts', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/src/bot/bot.ts b/src/bot/bot.ts[m
+[1mindex e54ccad..0ba82d7 100644[m
+[1m--- a/src/bot/bot.ts[m
+[1m+++ b/src/bot/bot.ts[m
+[36m@@ -98,6 +98,7 @@[m [mimport { reconcileAccounting, recoverMissingLedger, formatReconciliationReport }[m
+ import {[m
+   loadMultiConfig,[m
+   validateMultiConfig,[m
+[32m+[m[32m  getActiveStrategyName,[m
+   runMultiStrategy,[m
+   executeTradeIntent,[m
+   type MultiConfig,[m
+[36m@@ -1679,20 +1680,38 @@[m [mexport function createBot(): Bot {[m
+   // MULTI never bypasses the existing execution pipeline: this handler only[m
+   // calls runMultiStrategy()/executeTradeIntent(), which route through[m
+   // mintSingleSided() exactly like a manual mint.[m
+[32m+[m[32m  //[m
+[32m+[m[32m  // Strategy isolation (spec §9): being an authorized Telegram user is not[m
+[32m+[m[32m  // by itself "explicit selection" of MULTI — the deployment operator must[m
+[32m+[m[32m  // also opt in via STRATEGY=multi. Without it, /multi is inert regardless[m
+[32m+[m[32m  // of how valid the rest of the MULTI config is, and the default strategy[m
+[32m+[m[32m  // is completely unaffected either way.[m
+   bot.command('multi', async (ctx) => {[m
+     if (!(await requireAuth(ctx))) return;[m
+[32m+[m[32m    if (getActiveStrategyName() !== 'multi') {[m
+[32m+[m[32m      await ctx.reply('⛔ MULTI is not active on this bot (set STRATEGY=multi to enable).');[m
+[32m+[m[32m      return;[m
+[32m+[m[32m    }[m
+     await ctx.reply('Scanning GMGN 6h trending for MULTI candidates…');[m
+     await runMultiDryRunReport(ctx, false);[m
+   });[m
+ [m
+   bot.callbackQuery('multi:refresh', async (ctx) => {[m
+     if (!(await requireAuth(ctx))) return;[m
+[32m+[m[32m    if (getActiveStrategyName() !== 'multi') {[m
+[32m+[m[32m      await ctx.answerCallbackQuery({ text: 'MULTI is not active (STRATEGY=multi required)' });[m
+[32m+[m[32m      return;[m
+[32m+[m[32m    }[m
+     await ctx.answerCallbackQuery({ text: 'Refreshing…' });[m
+     await runMultiDryRunReport(ctx, true);[m
+   });[m
+ [m
+   bot.callbackQuery(/^multi:exec:(0x[a-fA-F0-9]{40})$/, async (ctx) => {[m
+     if (!(await requireAuth(ctx))) return;[m
+[32m+[m[32m    if (getActiveStrategyName() !== 'multi') {[m
+[32m+[m[32m      await ctx.answerCallbackQuery({ text: 'MULTI is not active (STRATEGY=multi required)' });[m
+[32m+[m[32m      return;[m
+[32m+[m[32m    }[m
+     const token = ctx.match![1];[m
+     const sess = getSession(ctx.from!.id);[m
+     const run = sess.multiRun;[m
+[1mdiff --git a/src/strategy/multiPool.ts b/src/strategy/multiPool.ts[m
+[1mindex 61bc7dc..42f5573 100644[m
+[1m--- a/src/strategy/multiPool.ts[m
+[1m+++ b/src/strategy/multiPool.ts[m
+[36m@@ -5,16 +5,24 @@[m [mimport type { MultiCandidate, MultiPoolCandidate } from './types.js';[m
+ [m
+ export type PoolFetcher = typeof listPoolsForToken;[m
+ [m
+[31m-/** Only these fee tiers are ever scored — never manufactured/substituted (spec §15). */[m
+[31m-const PREFERRED_FEE_TIERS = [500, 400, 300];[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Only these fee tiers are ever scored — never manufactured/substituted (spec §15).[m
+[32m+[m[32m * Units match the on-chain v3 `fee()` convention used everywhere else in this[m
+[32m+[m[32m * codebase (hundredths of a bip; fee/10000 = percent — see chain/pools.ts[m
+[32m+[m[32m * feeLabel). 5% = 50000, 4% = 40000, 3% = 30000. These are NOT the same as[m
+[32m+[m[32m * config.ts's default-strategy FEE_TIERS ([100, 500, 3000, 10000]) — MULTI[m
+[32m+[m[32m * intentionally prefers higher fee tiers for meme/volatile pairs and only[m
+[32m+[m[32m * ever selects one that is actually listed on-chain for the pair.[m
+[32m+[m[32m */[m
+[32m+[m[32mconst PREFERRED_FEE_TIERS = [50_000, 40_000, 30_000];[m
+ const TVL_REFERENCE_USD = 100_000;[m
+ const VOLUME_REFERENCE_USD = 50_000;[m
+ const VOLUME_TVL_RATIO_REFERENCE = 0.5;[m
+ [m
+ function feeScoreFor(fee: number | null): number {[m
+[31m-  if (fee === 500) return 1.0;[m
+[31m-  if (fee === 400) return 0.75;[m
+[31m-  if (fee === 300) return 0.5;[m
+[32m+[m[32m  if (fee === 50_000) return 1.0;[m
+[32m+[m[32m  if (fee === 40_000) return 0.75;[m
+[32m+[m[32m  if (fee === 30_000) return 0.5;[m
+   return 0;[m
+ }[m
+ [m
