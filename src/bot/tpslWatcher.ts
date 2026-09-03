@@ -14,7 +14,9 @@ import {
   listTpSlEnrolledPositions,
   markClosed,
   recordLedger,
+  setJournalAccountingMeta,
   setPositionTpSl,
+  type JournalAccountingMeta,
   type PositionTpSl,
 } from '../db/index.js';
 import { closePosition } from '../chain/close.js';
@@ -27,6 +29,17 @@ export { classify } from './tpslLogic.js';
 
 const POLL_MS = 30_000;
 const CONFIRM_MS = 5_000;
+/**
+ * Phase 4.6.4: bounded wait, on shutdown, for any close that had already
+ * started (past the recheck, already calling closePosition) before
+ * shutdown began. That in-flight work is never interrupted — it may
+ * already have submitted a transaction, and the existing (unmodified)
+ * journal/recovery system is what makes leaving it running safe. This
+ * constant only bounds how long stopTpslWatcher()'s own returned promise
+ * waits before giving up and resolving anyway ("forced-exit fallback") —
+ * it never cancels, marks failed, or fabricates a result for that work.
+ */
+const SHUTDOWN_DEADLINE_MS = 15_000;
 
 type Pending = {
   key: string;
@@ -35,12 +48,57 @@ type Pending = {
   at: number;
 };
 
+type WatcherState = 'stopped' | 'running' | 'stopping';
+
 const pending = new Map<string, Pending>();
 /** Prevent concurrent close of same position */
 const closing = new Set<string>();
+/**
+ * Phase 4.6.4: handles for every currently-armed 5s confirmation timer,
+ * keyed by position. Previously these setTimeout return values were
+ * discarded entirely — there was no way to cancel an armed trigger's
+ * confirmation wait at all; shutdown only *incidentally* neutralized it
+ * via pending.clear() (the callback would find nothing pending and
+ * no-op), but the timer itself kept running, unclearable and untracked.
+ */
+const confirmTimers = new Map<string, ReturnType<typeof setTimeout>>();
+/** Close operations currently in flight (already past the recheck, already calling closePosition) — tracked so shutdown can wait for them, bounded, without ever touching or interrupting them. */
+const inFlightCloses = new Set<Promise<void>>();
 
 let timer: ReturnType<typeof setInterval> | null = null;
 let running = false;
+let watcherState: WatcherState = 'stopped';
+/** Set once a shutdown is requested; repeated stopTpslWatcher() calls return this same promise (idempotency). */
+let shutdownPromise: Promise<void> | null = null;
+
+/**
+ * Test-only dependency injection (Phase 4.6.4). Production code always
+ * uses the real `measurePnl`/`closePosition` below (assigned once at
+ * module load, after both are defined) — this exists solely so the
+ * shutdown/cancellation lifecycle can be exercised deterministically
+ * without real RPC/chain calls, exactly the same pattern used elsewhere
+ * in this codebase (injectable mintFn, spawnFn, runner). Neither
+ * function's own logic (PnL calculation, close execution, accounting) is
+ * changed by this — only how the lifecycle code above them reaches them.
+ */
+type TpslDeps = {
+  measurePnl: (
+    chainId: SupportedChainId,
+    tokenId: string,
+    protocol: 'v3' | 'v4',
+    dex?: import('../config.js').DexId,
+  ) => Promise<MeasureResult>;
+  closePosition: typeof closePosition;
+};
+// eslint-disable-next-line @typescript-eslint/no-use-before-define
+let deps: TpslDeps = { measurePnl, closePosition };
+export function __setTpslDepsForTests(overrides: Partial<TpslDeps>): void {
+  deps = { ...deps, ...overrides };
+}
+export function __resetTpslDepsForTests(): void {
+  // eslint-disable-next-line @typescript-eslint/no-use-before-define
+  deps = { measurePnl, closePosition };
+}
 
 function posKey(p: Pick<PositionTpSl, 'chainId' | 'tokenId'>): string {
   return `${p.chainId}:${p.tokenId}`;
@@ -144,12 +202,41 @@ async function executeClose(
         `${kind.toUpperCase()} · PnL ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}% (${formatUsd(pnlUsd)})`,
     );
 
-    const result = await closePosition(
+    const result = await deps.closePosition(
       chainId,
       BigInt(p.tokenId),
       p.protocol,
       p.dex ?? 'uniswap',
     );
+
+    // Stage accounting metadata in the journal BEFORE recordLedger() so a
+    // crash between this point and the ledger writes below can be
+    // recovered automatically on the next startup (Phase 3.5) — mirrors
+    // the manual /close path in bot.ts exactly (Phase 4.7 finding: this
+    // automated close path was the only closePosition() caller missing it).
+    const closeMeta: JournalAccountingMeta[] = [
+      {
+        kind: 'withdrawal',
+        tokenId: p.tokenId,
+        tokenAddress: null,
+        amountRaw: null,
+        amountHuman: result.amount0Human + result.amount1Human,
+        usd: result.withdrawalUsd - result.feesPortionUsd,
+      },
+    ];
+    if (result.feesPortionUsd > 0) {
+      closeMeta.push({
+        kind: 'fee_claim',
+        tokenId: p.tokenId,
+        tokenAddress: null,
+        amountRaw: null,
+        amountHuman: null,
+        usd: result.feesPortionUsd,
+        feeSplitIsEstimated: result.feeSplitIsEstimated,
+      });
+    }
+    setJournalAccountingMeta(chainId, result.hash, closeMeta);
+
     recordLedger({
       chainId,
       tokenId: p.tokenId,
@@ -193,6 +280,7 @@ async function executeClose(
 }
 
 async function tick(bot: Bot): Promise<void> {
+  if (watcherState !== 'running') return;
   if (running) return;
   running = true;
   try {
@@ -223,7 +311,7 @@ async function tick(bot: Bot): Promise<void> {
         if (closing.has(key)) continue;
 
         const { tp, sl } = resolveLevels(p);
-        const m = await measurePnl(chainId, p.tokenId, p.protocol, p.dex ?? 'uniswap');
+        const m = await deps.measurePnl(chainId, p.tokenId, p.protocol, p.dex ?? 'uniswap');
         if (m.status === 'gone') {
           // Confirmed gone (verified ownership/empty) — safe to unenroll
           setPositionTpSl(chainId, p.tokenId, { enabled: false });
@@ -274,10 +362,15 @@ async function tick(bot: Bot): Promise<void> {
               `_Experimental: closes only if still beyond level after 5s_`,
           );
 
-          // Dedicated recheck after 5s (don't wait for next 30s tick)
-          setTimeout(() => {
+          // Dedicated recheck after 5s (don't wait for next 30s tick).
+          // Handle is tracked so shutdown can actually cancel it — an
+          // armed-but-not-yet-fired trigger must not survive a shutdown
+          // request (Phase 4.6.4).
+          const t = setTimeout(() => {
+            confirmTimers.delete(key);
             void recheckAndMaybeClose(bot, p, hit, tp, sl);
           }, CONFIRM_MS);
+          confirmTimers.set(key, t);
           continue;
         }
 
@@ -298,6 +391,7 @@ async function recheckAndMaybeClose(
   tp: number,
   sl: number,
 ): Promise<void> {
+  if (watcherState !== 'running') return;
   const key = posKey(p);
   const pend = pending.get(key);
   if (!pend || pend.kind !== expected) return;
@@ -317,7 +411,7 @@ async function recheckAndMaybeClose(
   }
 
   const chainId = p.chainId as SupportedChainId;
-  const m = await measurePnl(chainId, p.tokenId, p.protocol, p.dex ?? 'uniswap');
+  const m = await deps.measurePnl(chainId, p.tokenId, p.protocol, p.dex ?? 'uniswap');
   if (m.status === 'gone') {
     pending.delete(key);
     setPositionTpSl(chainId, p.tokenId, { enabled: false });
@@ -345,25 +439,157 @@ async function recheckAndMaybeClose(
     return;
   }
 
-  // Persist → close
-  await executeClose(bot, p, expected, m.pnlPct ?? 0, m.pnlUsd, m.label);
+  // Re-check right before committing: measurePnl above involved awaits, so
+  // shutdown may have started in the meantime. If it has, this is still
+  // the pre-submission checkpoint — no transaction exists yet — so bail
+  // out here rather than starting one (§6.A: shutdown before submission
+  // -> zero sends). Once executeClose is actually called below, it is
+  // tracked and allowed to run to completion untouched (§6.B/D) — it is
+  // never safe to interrupt a close that may already be broadcasting.
+  if (watcherState !== 'running') return;
+
+  // Persist → close. Tracked in inFlightCloses so a concurrent shutdown
+  // can wait (bounded) for this to finish without ever cancelling it.
+  const closePromise = executeClose(bot, p, expected, m.pnlPct ?? 0, m.pnlUsd, m.label);
+  inFlightCloses.add(closePromise);
+  try {
+    await closePromise;
+  } finally {
+    inFlightCloses.delete(closePromise);
+  }
 }
+
+let startupTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function startTpslWatcher(bot: Bot): void {
   if (timer) return;
   console.log(
     `[tpsl] experimental watcher started (poll ${POLL_MS / 1000}s, confirm ${CONFIRM_MS / 1000}s)`,
   );
+  watcherState = 'running';
+  shutdownPromise = null;
   // First tick delayed so bot is fully up
-  setTimeout(() => void tick(bot), 8_000);
+  startupTimer = setTimeout(() => {
+    startupTimer = null;
+    void tick(bot);
+  }, 8_000);
   timer = setInterval(() => void tick(bot), POLL_MS);
 }
 
-export function stopTpslWatcher(): void {
+/**
+ * Phase 4.6.4: bounded, idempotent shutdown.
+ *
+ * 1. Immediately marks the watcher 'stopping' — tick() and
+ *    recheckAndMaybeClose() both check this and refuse to do any new work
+ *    (no new arms, no new closes started) from this point on, closing the
+ *    "shutdown started -> watcher polls again -> new transaction
+ *    submitted" gap.
+ * 2. Stops the poll interval and the (rare) delayed first-tick timer.
+ * 3. Cancels every armed-but-not-yet-fired 5s confirmation timer — the
+ *    actual P2 fix. Previously these handles were discarded; an armed
+ *    trigger's confirmation wait could not be cancelled at all.
+ * 4. Waits, bounded by SHUTDOWN_DEADLINE_MS, for any close that was
+ *    already in flight (already past the recheck, already calling
+ *    closePosition) when shutdown began. That work is never interrupted —
+ *    it is only ever waited for, and only up to the deadline. If the
+ *    deadline passes first, this function still resolves (the
+ *    "forced-exit fallback" the audit asked for) rather than hanging
+ *    forever; the in-flight close keeps running independently and its
+ *    outcome is still handled entirely by the existing (untouched)
+ *    journal/recovery system — nothing here marks it confirmed, failed,
+ *    or removes its journal entry.
+ *
+ * Repeated calls (multiple SIGTERM/SIGINT, or any other caller) return
+ * the exact same promise — only one shutdown sequence ever actually runs.
+ */
+export function stopTpslWatcher(): Promise<void> {
+  if (shutdownPromise) return shutdownPromise;
+  if (watcherState === 'stopped') return Promise.resolve();
+
+  watcherState = 'stopping';
+
   if (timer) {
     clearInterval(timer);
     timer = null;
   }
+  if (startupTimer) {
+    clearTimeout(startupTimer);
+    startupTimer = null;
+  }
+  for (const t of confirmTimers.values()) {
+    clearTimeout(t);
+  }
+  confirmTimers.clear();
+  pending.clear();
+
+  const inFlight = [...inFlightCloses];
+  shutdownPromise = (async () => {
+    if (inFlight.length > 0) {
+      console.log(`[tpsl] shutdown: waiting up to ${SHUTDOWN_DEADLINE_MS}ms for ${inFlight.length} in-flight close(s)`);
+      let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+      const deadline = new Promise<void>((r) => {
+        deadlineTimer = setTimeout(r, SHUTDOWN_DEADLINE_MS);
+      });
+      try {
+        await Promise.race([Promise.allSettled(inFlight), deadline]);
+      } finally {
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+      }
+    }
+    closing.clear();
+    watcherState = 'stopped';
+    console.log('[tpsl] shutdown complete');
+  })();
+
+  return shutdownPromise;
+}
+
+// ── Test-only exports (Phase 4.6.4) ─────────────────────────────────────
+// None of these are used by production code (src/index.ts only calls the
+// public startTpslWatcher/stopTpslWatcher above). They exist solely to
+// make the shutdown/cancellation lifecycle deterministically testable.
+
+/** Directly invoke one poll tick — normally only reachable via the internal setInterval. */
+export { tick as __tickForTests };
+
+export function __getWatcherStateForTests(): WatcherState {
+  return watcherState;
+}
+export function __getPendingCountForTests(): number {
+  return pending.size;
+}
+export function __getConfirmTimerCountForTests(): number {
+  return confirmTimers.size;
+}
+export function __getInFlightCloseCountForTests(): number {
+  return inFlightCloses.size;
+}
+export function __isClosingForTests(chainId: number, tokenId: string): boolean {
+  return closing.has(`${chainId}:${tokenId}`);
+}
+
+/**
+ * Full reset between tests: clears every module-level lifecycle map/flag
+ * and restores the real (non-overridden) measurePnl/closePosition. Does
+ * NOT touch any db/index.ts state — tests still own their own scratch DB
+ * lifecycle exactly as every other suite in this codebase does.
+ */
+export function __resetTpslWatcherForTests(): void {
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+  if (startupTimer) {
+    clearTimeout(startupTimer);
+    startupTimer = null;
+  }
+  for (const t of confirmTimers.values()) clearTimeout(t);
+  confirmTimers.clear();
   pending.clear();
   closing.clear();
+  inFlightCloses.clear();
+  running = false;
+  watcherState = 'stopped';
+  shutdownPromise = null;
+  __resetTpslDepsForTests();
 }

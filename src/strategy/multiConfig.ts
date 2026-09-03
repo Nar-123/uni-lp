@@ -33,6 +33,48 @@ export function getActiveStrategyName(): StrategyName {
   return raw === 'multi' ? 'multi' : 'default';
 }
 
+/**
+ * Phase 4.6.10: the complete, authoritative list of STRATEGY values this
+ * codebase recognizes — kept in sync with the `StrategyName` union itself
+ * (not invented independently), so a new strategy added to that type must
+ * also be added here to become acceptable.
+ */
+const VALID_STRATEGY_NAMES: readonly StrategyName[] = ['default', 'multi'];
+
+/**
+ * Phase 4.6.10: authoritative startup-time STRATEGY validation — the one
+ * place a present-but-unrecognized value (typo, empty string, garbage) is
+ * rejected outright rather than silently absorbed into the default
+ * strategy. Call once, early at process startup, before any
+ * transaction-capable service starts; a thrown error here is expected to
+ * propagate all the way to the top-level startup failure handler.
+ *
+ * Deliberately separate from `getActiveStrategyName()` above, which stays
+ * unchanged and must keep never throwing — it is called live, on every
+ * `/multi`-family Telegram command (see bot.ts), not just once at startup,
+ * so making it throw would turn an invalid STRATEGY into a per-command
+ * runtime error instead of a single, controlled startup failure. By the
+ * time `getActiveStrategyName()` is ever invoked, this function has
+ * already guaranteed `process.env.STRATEGY` is either unset or a name in
+ * `VALID_STRATEGY_NAMES` — env vars do not change during a process's life.
+ *
+ * MISSING (unset) STRATEGY is intentionally NOT an error — it is the
+ * existing, documented default, matching `getActiveStrategyName()`'s own
+ * `?? 'default'` contract. A PRESENT value is normalized the exact same
+ * way `getActiveStrategyName()` already does (trim + lowercase — existing
+ * behavior, not new normalization) before being checked for membership;
+ * only a value that still doesn't match any known name after that fails.
+ */
+export function assertValidStrategyEnv(): void {
+  const raw = process.env.STRATEGY;
+  if (raw == null) return; // unset — existing default applies, not an error
+  const normalized = raw.trim().toLowerCase();
+  if ((VALID_STRATEGY_NAMES as readonly string[]).includes(normalized)) return;
+  throw new Error(
+    `Invalid STRATEGY "${raw}": expected one of ${VALID_STRATEGY_NAMES.join(', ')} (or unset, which defaults to 'default')`,
+  );
+}
+
 function envNum(key: string, fallback: number): number {
   const raw = process.env[key];
   if (raw == null || raw.trim() === '') return fallback;
@@ -47,12 +89,6 @@ function envPositiveOrNull(key: string): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-function envAddress(key: string): Address | null {
-  const raw = process.env[key]?.trim();
-  if (!raw) return null;
-  return isAddress(raw) ? (raw as Address) : null;
-}
-
 function resolveChainId(chainId?: SupportedChainId): SupportedChainId {
   if (chainId != null) return chainId;
   const raw = envNum('MULTI_CHAIN_ID', 4663);
@@ -65,10 +101,22 @@ function resolveChainId(chainId?: SupportedChainId): SupportedChainId {
  * USDG contract (CHAINS[chainId].usdg). Never resolved by symbol — a chain
  * with no known USDG address returns null (MULTI entry disabled for it),
  * per the spec's "no fallback to USDC/USDT/WETH/native" rule.
+ *
+ * Phase 4.7 fix: a MULTI_USDG_ADDRESS that is present but malformed (typo,
+ * truncated, ENS name, trailing punctuation) must fail closed to null —
+ * exactly like "unset" — rather than silently substituting the chain
+ * default. Silently trading against a different quote asset than the one
+ * the operator explicitly configured is a worse outcome than disabling
+ * MULTI entirely; validateMultiConfig()'s existing `!usdgAddress` check
+ * already disables MULTI with a clear reason for null, so returning null
+ * here (instead of the chain default) routes a malformed override through
+ * that same safe, already-tested path.
  */
 function resolveUsdgAddress(chainId: SupportedChainId): Address | null {
-  const explicit = envAddress('MULTI_USDG_ADDRESS');
-  if (explicit) return explicit;
+  const raw = process.env.MULTI_USDG_ADDRESS?.trim();
+  if (raw) {
+    return isAddress(raw) ? (raw as Address) : null;
+  }
   return CHAINS[chainId].usdg ?? null;
 }
 

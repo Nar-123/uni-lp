@@ -18,6 +18,40 @@ export function isNativeTokenAddress(address: Address | string): boolean {
 }
 
 const metaCache = new Map<string, TokenMeta>();
+/**
+ * Phase 4.6.8: token metadata (symbol/name/decimals) never changes for a
+ * given ERC-20 once fetched, so this cache had no TTL — correct — but also
+ * no size bound, so a distinct key was added forever (MULTI evaluates a
+ * different meme token address on almost every run). Bounding by count
+ * rather than time is the right fix here specifically because the cached
+ * value never goes stale: an evicted key just means the next lookup pays
+ * one more on-chain read and re-caches the identical result, never a
+ * different or incorrect one. FIFO via Map's insertion-order iteration
+ * keeps this O(1) — no scan, no timestamps needed.
+ */
+const MAX_META_CACHE_SIZE = 500;
+
+function setMetaCacheBounded(key: string, meta: TokenMeta): void {
+  if (!metaCache.has(key) && metaCache.size >= MAX_META_CACHE_SIZE) {
+    const oldestKey = metaCache.keys().next().value;
+    if (oldestKey !== undefined) metaCache.delete(oldestKey);
+  }
+  metaCache.set(key, meta);
+}
+
+/** Test-only: exercise the bounded-cache logic directly, without a real RPC call. */
+export function __setMetaCacheEntryForTests(key: string, meta: TokenMeta): void {
+  setMetaCacheBounded(key, meta);
+}
+export function __metaCacheSizeForTests(): number {
+  return metaCache.size;
+}
+export function __metaCacheHasForTests(key: string): boolean {
+  return metaCache.has(key);
+}
+export function __resetMetaCacheForTests(): void {
+  metaCache.clear();
+}
 
 /**
  * ERC-20 metadata. For native (address zero) returns chain native meta
@@ -40,7 +74,7 @@ export async function getTokenMeta(
       name: c.nativeSymbol,
       decimals: 18,
     };
-    metaCache.set(key, meta);
+    setMetaCacheBounded(key, meta);
     return meta;
   }
 
@@ -57,7 +91,7 @@ export async function getTokenMeta(
     name: String(name),
     decimals: Number(decimals),
   };
-  metaCache.set(key, meta);
+  setMetaCacheBounded(key, meta);
   return meta;
 }
 
@@ -83,6 +117,36 @@ const supplyCache = new Map<string, { raw: bigint; at: number }>();
 const SUPPLY_CACHE_MS = 60_000;
 
 /**
+ * Phase 4.6.8: this cache had a TTL (staleness is checked on read below) but
+ * no eviction — a key whose TTL has already lapsed and is never looked up
+ * again just sits in the map forever, growing with every distinct token
+ * address ever queried. Since the TTL check already makes an expired entry
+ * unusable (a fresh read replaces it on next lookup regardless), dropping
+ * it early changes nothing observable — mirrors the same prune-on-write
+ * idiom already used by volumeAlertWatcher.ts's `pruneCooldowns`.
+ */
+function pruneSupplyCache(): void {
+  const cutoff = Date.now() - SUPPLY_CACHE_MS;
+  for (const [key, entry] of supplyCache) {
+    if (entry.at < cutoff) supplyCache.delete(key);
+  }
+}
+
+/** Test-only: exercise the TTL-prune logic directly, without a real RPC call. */
+export function __setSupplyCacheEntryForTests(key: string, raw: bigint, at: number): void {
+  supplyCache.set(key, { raw, at });
+}
+export function __pruneSupplyCacheForTests(): void {
+  pruneSupplyCache();
+}
+export function __supplyCacheSizeForTests(): number {
+  return supplyCache.size;
+}
+export function __resetSupplyCacheForTests(): void {
+  supplyCache.clear();
+}
+
+/**
  * ERC-20 totalSupply (raw). Native returns 0 (a real, known value — natives
  * have no ERC-20 supply concept). On read failure, supply is UNKNOWN and
  * must not be reported as 0 (0 supply silently implies $0 market cap for
@@ -103,6 +167,7 @@ export async function getTokenTotalSupply(
       abi: erc20Abi,
       functionName: 'totalSupply',
     });
+    pruneSupplyCache();
     supplyCache.set(key, { raw: raw as bigint, at: Date.now() });
     return raw as bigint;
   } catch {

@@ -8,6 +8,65 @@ function requireEnv(key: string): string {
   return v;
 }
 
+/**
+ * Phase 4.6.6: fail-closed validation for an environment-supplied RPC URL.
+ * Only http/https are accepted — the only schemes this codebase's actual
+ * transport (viem's `http()`, see chain/clients.ts's getPublicClient/
+ * getWalletClient) can use; anything else would silently never work.
+ * Absent env vars are untouched here — callers only invoke this when the
+ * variable is actually present, so a missing (optional) RPC override
+ * still falls through to the existing hardcoded default unchanged.
+ */
+export function assertValidRpcUrl(varName: string, raw: string): string {
+  if (raw !== raw.trim() || raw.trim() === '') {
+    throw new Error(
+      `Invalid ${varName}: value is empty or has leading/trailing whitespace`,
+    );
+  }
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`Invalid ${varName}: not a valid URL (expected http:// or https://)`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(
+      `Invalid ${varName}: unsupported protocol "${url.protocol}" (expected http:// or https://)`,
+    );
+  }
+  return raw;
+}
+
+/** Reads an RPC env var if present, validating it; returns the default unvalidated (trusted, hardcoded) if absent. */
+function resolveRpcUrl(varName: string, defaultUrl: string): string {
+  const raw = process.env[varName];
+  if (raw == null) return defaultUrl;
+  return assertValidRpcUrl(varName, raw);
+}
+
+/**
+ * Phase 4.6.6: fail-closed validation for an environment-supplied EVM
+ * address, using viem's own `isAddress` (already a dependency — no new
+ * validation library added). Absent env vars are untouched — this is
+ * only invoked when the variable is actually present.
+ */
+export function assertValidOptionalAddress(varName: string, raw: string): Address {
+  if (raw !== raw.trim() || raw.trim() === '') {
+    throw new Error(`Invalid ${varName}: value is empty or has leading/trailing whitespace`);
+  }
+  if (!isAddress(raw)) {
+    throw new Error(`Invalid ${varName}: not a valid EVM address`);
+  }
+  return raw as Address;
+}
+
+/** Reads an optional address env var if present, validating it; undefined if absent (existing behavior preserved). */
+function resolveOptionalAddressEnv(varName: string): Address | undefined {
+  const raw = process.env[varName];
+  if (raw == null) return undefined;
+  return assertValidOptionalAddress(varName, raw);
+}
+
 function parseUserIds(raw: string | undefined): Set<number> {
   if (!raw?.trim()) throw new Error('Missing env: TELEGRAM_USER_IDS');
   const ids = raw
@@ -80,7 +139,7 @@ export const CHAINS = {
     wrapped: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73' as Address,
     /** Primary stable on Robinhood */
     usdg: '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168' as Address,
-    usdc: (process.env.USDC_4663 as Address | undefined) ?? undefined,
+    usdc: resolveOptionalAddressEnv('USDC_4663'),
     usdt: undefined as Address | undefined,
     // Uniswap v4 (official deployments)
     v4PoolManager: '0x8366a39cc670b4001a1121b8f6a443a643e40951' as Address,
@@ -209,9 +268,9 @@ export function getConfig(): AppConfig {
     walletPath: wallet.walletPath,
     dbPath: process.env.DB_PATH ?? './data/bot.json',
     rpc: {
-      4663: process.env.RPC_4663 ?? CHAINS[4663].defaultRpc,
-      56: process.env.RPC_56 ?? CHAINS[56].defaultRpc,
-      8453: process.env.RPC_8453 ?? CHAINS[8453].defaultRpc,
+      4663: resolveRpcUrl('RPC_4663', CHAINS[4663].defaultRpc),
+      56: resolveRpcUrl('RPC_56', CHAINS[56].defaultRpc),
+      8453: resolveRpcUrl('RPC_8453', CHAINS[8453].defaultRpc),
     },
   };
   return _config;

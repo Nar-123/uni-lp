@@ -20,6 +20,7 @@ import {
   getPublicClient,
   getWalletClient,
 } from './clients.js';
+import { EXECUTION_RECEIPT_TIMEOUT_MS } from './receiptWait.js';
 
 export const TRADING_API_URL = 'https://trade-api.gateway.uniswap.org/v1';
 
@@ -196,7 +197,7 @@ async function broadcastTx(
   }
 
   const hash = await wallet.sendTransaction(sendParams);
-  const receipt = await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   if (receipt.status !== 'success') {
     throw new Error(`Trading API tx reverted: ${hash}`);
   }

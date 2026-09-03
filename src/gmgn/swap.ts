@@ -16,6 +16,7 @@ import {
   gmgnQuote,
   type GmgnQuote,
 } from './cli.js';
+import { EXECUTION_RECEIPT_TIMEOUT_MS } from '../chain/receiptWait.js';
 
 /**
  * Who signs the swap.
@@ -93,7 +94,7 @@ async function ensureRouterAllowance(
     account: wallet.account,
     chain: wallet.chain,
   });
-  await client.waitForTransactionReceipt({ hash });
+  await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
 }
 
 function validateQuote(
@@ -227,7 +228,7 @@ export async function gmgnSwap(params: {
     ...(quote.tx.gas_limit ? { gas: BigInt(quote.tx.gas_limit) } : {}),
   });
 
-  const receipt = await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   if (receipt.status !== 'success') {
     throw new GmgnError(`GMGN swap reverted: ${txUrl(chainId, hash)}`);
   }

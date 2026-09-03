@@ -36,13 +36,22 @@ const USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168';
  * from the same on-disk DB_PATH file — it does not clear that file. Each
  * test in this suite needs a genuinely empty store (position counts / open
  * journal entries must not leak across cases), so also delete the file.
+ *
+ * Phase 4.6.1: persist() now also maintains `<path>.bak` (previous
+ * generation) and, transiently, `<path>.tmp` sidecars for crash recovery.
+ * Deleting only the primary is no longer enough to get a genuinely empty
+ * store on the next load() — load() will correctly (and, outside tests,
+ * desirably) recover from `.bak` instead of starting empty. Tests want the
+ * opposite of crash recovery here, so all three must be removed.
  */
 function resetDb(): void {
   __resetStoreForTests();
-  try {
-    fs.rmSync(process.env.DB_PATH!, { force: true });
-  } catch {
-    /* ignore */
+  for (const suffix of ['', '.bak', '.tmp']) {
+    try {
+      fs.rmSync(`${process.env.DB_PATH!}${suffix}`, { force: true });
+    } catch {
+      /* ignore */
+    }
   }
 }
 

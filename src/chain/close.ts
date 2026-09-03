@@ -18,6 +18,7 @@ import {
   SafetyError,
 } from './safety.js';
 import { estimateWriteGas } from './gas.js';
+import { EXECUTION_RECEIPT_TIMEOUT_MS } from './receiptWait.js';
 
 export type CloseResult = {
   hash: Hash;
@@ -363,7 +364,7 @@ export async function closePosition(
           chain: wallet.chain,
           gas: multicallGas,
         });
-        const receipt = await client.waitForTransactionReceipt({ hash: h });
+        const receipt = await client.waitForTransactionReceipt({ hash: h, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
         if (receipt.status !== 'success') throw new Error(`multicall reverted ${h}`);
         return h;
       } catch (e1) {
@@ -403,7 +404,7 @@ export async function closePosition(
               chain: wallet.chain,
               gas: decreaseGas,
             });
-            const r1 = await client.waitForTransactionReceipt({ hash: h1 });
+            const r1 = await client.waitForTransactionReceipt({ hash: h1, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
             if (r1.status !== 'success') throw new Error(`decrease reverted ${h1}`);
           }
         }
@@ -434,7 +435,7 @@ export async function closePosition(
           chain: wallet.chain,
           gas: collectGas,
         });
-        const r2 = await client.waitForTransactionReceipt({ hash: h2 });
+        const r2 = await client.waitForTransactionReceipt({ hash: h2, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
         if (r2.status !== 'success') throw new Error(`collect reverted ${h2}`);
         return h2;
       }
@@ -477,7 +478,7 @@ export async function closePosition(
       chain: wallet.chain,
       gas: burnGas,
     });
-    await client.waitForTransactionReceipt({ hash: burnHash });
+    await client.waitForTransactionReceipt({ hash: burnHash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   } catch {
     /* NFT may remain with 0 liquidity — OK */
   }
@@ -637,7 +638,7 @@ export async function claimFees(
     chain: wallet.chain,
     gas: claimGas,
   });
-  const receipt = await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   if (receipt.status !== 'success') {
     throw new Error(`claimFees v3 #${tokenId} tx reverted: ${hash}`);
   }

@@ -698,13 +698,20 @@ Build:       clean (tsc)
 Integration: re-run this phase; see below for classification
 ```
 
-`npm run test:integration` was re-run in full. As in Phase 4.5, this suite
+`npm run test:integration` was re-run in full: **2 passed, 1 timed out**
+(`live RPC: getExecutableQuoteV3 succeeds against a real pool and matches
+an independent full-tick-range cross-check` — `'test timed out after
+300000ms'`, total suite duration ~1,158s). As in Phase 4.5, this suite
 targets chain 8453 (Base) via `test/integration/quote.rpc.test.ts` — a
 pre-existing Phase 2 test, unrelated to MULTI or to this phase's fix — and
-is independently rate-limited against Base's public RPC. Classification:
+is independently rate-limited against Base's public RPC (dozens of
+`ticks rate-limited, retry N/10` lines precede the timeout; a `tickBitmap`
+cross-check in the same run did succeed with a real on-chain result:
+`amountOut=120444082` over 528 ticks). Classification:
 **RPC ISSUE / ENVIRONMENT ISSUE**, not a code regression — this is the same
 pre-existing flakiness documented in Phase 4.5, reproduced again
-independently. No failure in this suite touches `gmgn-cli`, chain 4663, or
+independently, with the same 2-pass/1-timeout shape as prior runs this
+session. No failure in this suite touches `gmgn-cli`, chain 4663, or
 any MULTI code path.
 
 ## MULTI Regression Verification

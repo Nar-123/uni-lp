@@ -248,6 +248,10 @@ export function recoverMissingLedger(chainId: number | null = null): LedgerRecov
           amountHuman: m.amountHuman ?? undefined,
           usd: m.usd,
           txHash: entry.txHash,
+          // Carry the staged strategy tag through recovery — otherwise a
+          // MULTI-originated ledger row reconstructed here after a crash
+          // would silently lose its 'multi' attribution.
+          strategy: m.strategy,
         });
         findings.push({
           chainId: entry.chainId,

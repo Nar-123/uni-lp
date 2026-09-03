@@ -20,9 +20,14 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { gmgnJson, GmgnError, GmgnRateLimitError, runGmgnProcess } from '../src/gmgn/cli.js';
+import { EventEmitter } from 'node:events';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import crossSpawn from 'cross-spawn';
+import { gmgnJson, GmgnError, GmgnRateLimitError, runGmgnProcess, type SpawnedProcess } from '../src/gmgn/cli.js';
 
 const NODE = process.execPath;
+const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
 
 // ── Real spawn (no mocking) — proves the actual cross-platform mechanism ──
 
@@ -235,3 +240,272 @@ test('argument safety: ordinary GMGN argument values (address, chain name, numbe
   );
   assert.deepEqual(result, { ok: true });
 });
+
+// ── Phase 4.6.2: SIGTERM -> SIGKILL escalation ────────────────────────────
+//
+// Two layers of coverage, deliberately:
+//
+// 1. A fully-controlled fake "child process" (constructed here, injected
+//    via runGmgnProcess's spawnFn option) to deterministically and
+//    portably prove the exact escalation LOGIC — grace timing, exactly-
+//    once settlement, every kill()-throws/race permutation. Real OS
+//    signal semantics differ enough between POSIX and Windows (Windows
+//    has no real "ignore a signal" capability — any kill() call already
+//    terminates unconditionally there) that these specific sequencing
+//    guarantees are best proven this way, not by racing a real timer
+//    against a real OS scheduler.
+// 2. A real OS process (test/fixtures/ignore-sigterm.mjs) for genuine
+//    end-to-end coverage — see "real OS process" below.
+
+type FakeChild = {
+  child: SpawnedProcess;
+  emitClose: (code: number | null, signal: NodeJS.Signals | null) => void;
+  emitError: (err: Error) => void;
+  emitStdout: (chunk: string) => void;
+  killCalls: NodeJS.Signals[];
+};
+
+/**
+ * `killBehavior(signal)` decides what a `.kill(signal)` call does:
+ * - 'ignore': recorded, nothing else happens (simulates a child that
+ *   doesn't react — either it's still starting up, or it trapped/ignored
+ *   the signal).
+ * - 'exit': recorded, and 'close' is emitted shortly after (simulates the
+ *   signal successfully terminating the child).
+ * - 'throw': the call throws synchronously (simulates ESRCH — the
+ *   process already exited before this signal could be delivered).
+ */
+function makeFakeChild(killBehavior: (signal: NodeJS.Signals) => 'ignore' | 'exit' | 'throw'): FakeChild {
+  const emitter = new EventEmitter();
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  const killCalls: NodeJS.Signals[] = [];
+
+  const child: SpawnedProcess = {
+    stdout: stdout as unknown as NodeJS.ReadableStream,
+    stderr: stderr as unknown as NodeJS.ReadableStream,
+    on: (event, listener) => emitter.on(event, listener as never),
+    kill: (signal: NodeJS.Signals) => {
+      killCalls.push(signal);
+      const behavior = killBehavior(signal);
+      if (behavior === 'throw') {
+        // Event-driven, not a guessed delay: schedule 'close' to follow
+        // right behind the throw regardless of system load / timer jitter,
+        // since a fixed-delay race against the production grace timer is
+        // inherently flaky under load (observed: 2035ms vs a 2000ms grace
+        // timer left far too thin a margin when run alongside every other
+        // test file's own timers).
+        setImmediate(() => emitter.emit('close', null, signal));
+        throw new Error('kill ESRCH: no such process');
+      }
+      if (behavior === 'exit') {
+        setImmediate(() => emitter.emit('close', null, signal));
+      }
+      return true;
+    },
+  };
+
+  return {
+    child,
+    emitClose: (code, signal) => emitter.emit('close', code, signal),
+    emitError: (err) => emitter.emit('error', err),
+    emitStdout: (chunk) => stdout.emit('data', Buffer.from(chunk)),
+    killCalls,
+  };
+}
+
+function runWithFakeChild(
+  fake: FakeChild,
+  opts: { timeoutMs?: number; maxBufferBytes?: number } = {},
+) {
+  return runGmgnProcess('fake-cli', ['some', 'args'], {
+    timeoutMs: opts.timeoutMs ?? 30,
+    maxBufferBytes: opts.maxBufferBytes ?? 1024 * 1024,
+    env: process.env,
+    spawnFn: () => fake.child,
+  });
+}
+
+test('escalation: process exits promptly after SIGTERM -> SIGKILL is never sent', async (t) => {
+  t.diagnostic('bounded by node:test default timeout; expected to finish in well under 1s');
+  const fake = makeFakeChild((signal) => (signal === 'SIGTERM' ? 'exit' : 'ignore'));
+  await assert.rejects(
+    () => runWithFakeChild(fake),
+    (err: NodeJS.ErrnoException & { killed?: boolean }) => {
+      assert.equal(err.killed, true);
+      return true;
+    },
+  );
+  assert.deepEqual(fake.killCalls, ['SIGTERM'], 'a child that responds to SIGTERM must never receive SIGKILL');
+
+  // Timer cleanup: wait past where the grace/kill timers WOULD have fired
+  // if they were not cleared, and confirm no further kill() call happened.
+  await new Promise((r) => setTimeout(r, 2_500));
+  assert.deepEqual(fake.killCalls, ['SIGTERM'], 'grace/kill timers must be cleared on settlement, not fire later');
+});
+
+test('escalation: a child that ignores SIGTERM is escalated to SIGKILL', async () => {
+  const fake = makeFakeChild((signal) => (signal === 'SIGTERM' ? 'ignore' : 'exit'));
+  await assert.rejects(
+    () => runWithFakeChild(fake),
+    (err: NodeJS.ErrnoException & { killed?: boolean }) => {
+      assert.equal(err.killed, true);
+      return true;
+    },
+  );
+  assert.deepEqual(fake.killCalls, ['SIGTERM', 'SIGKILL'], 'an unresponsive child must be escalated to SIGKILL');
+}, { timeout: 8_000 });
+
+test('escalation: a child that ignores both signals does not make the wrapper wait forever', async () => {
+  const fake = makeFakeChild(() => 'ignore');
+  const start = Date.now();
+  await assert.rejects(
+    () => runWithFakeChild(fake),
+    (err: NodeJS.ErrnoException & { killed?: boolean }) => {
+      assert.equal(err.killed, true);
+      return true;
+    },
+  );
+  const elapsedMs = Date.now() - start;
+  assert.ok(elapsedMs < 8_000, `must settle on its own bounded timeout even if the child never dies (took ${elapsedMs}ms)`);
+  assert.deepEqual(fake.killCalls, ['SIGTERM', 'SIGKILL']);
+}, { timeout: 10_000 });
+
+test('escalation: SIGTERM throwing (process already gone) settles safely, not as a fatal error', async () => {
+  // 'throw' represents "it had already exited" at essentially the same
+  // moment our timeout fired (a genuine kernel-level race); makeFakeChild
+  // schedules the resulting 'close' event immediately after the throw.
+  const fake = makeFakeChild((signal) => (signal === 'SIGTERM' ? 'throw' : 'exit'));
+  await assert.rejects(
+    () => runWithFakeChild(fake),
+    (err: NodeJS.ErrnoException & { killed?: boolean }) => {
+      assert.equal(err.killed, true);
+      return true;
+    },
+  );
+});
+
+test('escalation: SIGKILL throwing (process already gone) settles safely, not as a fatal error', async () => {
+  // SIGTERM is ignored (no auto-close) so the grace timer genuinely reaches
+  // the SIGKILL attempt; 'throw' there schedules 'close' immediately after.
+  const fake = makeFakeChild((signal) => (signal === 'SIGTERM' ? 'ignore' : 'throw'));
+  await assert.rejects(
+    () => runWithFakeChild(fake),
+    (err: NodeJS.ErrnoException & { killed?: boolean }) => {
+      assert.equal(err.killed, true);
+      return true;
+    },
+  );
+  assert.deepEqual(fake.killCalls, ['SIGTERM', 'SIGKILL']);
+}, { timeout: 8_000 });
+
+test('escalation: a close(code=0) event racing after timeout is still reported as timeout, never as success', async () => {
+  const fake = makeFakeChild(() => 'ignore');
+  // Simulate the process happening to finish (successfully!) just after
+  // the timeout fired — this must not be mistaken for a real success.
+  setTimeout(() => fake.emitClose(0, null), 40);
+  await assert.rejects(
+    () => runWithFakeChild(fake, { timeoutMs: 30 }),
+    (err: NodeJS.ErrnoException & { killed?: boolean }) => {
+      assert.equal(err.killed, true, 'a post-timeout close(0) must not resolve the promise as a success');
+      return true;
+    },
+  );
+});
+
+test('escalation: an error event racing after timeout is reported as timeout, never leaked raw', async () => {
+  const fake = makeFakeChild(() => 'ignore');
+  setTimeout(() => fake.emitError(new Error('some unrelated stream error')), 40);
+  await assert.rejects(
+    () => runWithFakeChild(fake, { timeoutMs: 30 }),
+    (err: NodeJS.ErrnoException & { killed?: boolean; message: string }) => {
+      assert.equal(err.killed, true);
+      assert.match(err.message, /timed out/i, 'the raw racing error must not leak past a declared timeout');
+      return true;
+    },
+  );
+});
+
+test('escalation: timeout never becomes a malformed-JSON error even if stdout received data first', async () => {
+  const fake = makeFakeChild(() => 'ignore');
+  fake.emitStdout('not valid json {{{');
+  setTimeout(() => fake.emitClose(0, null), 40);
+  await assert.rejects(
+    () => runWithFakeChild(fake, { timeoutMs: 30 }),
+    (err: NodeJS.ErrnoException & { killed?: boolean }) => {
+      assert.equal(err.killed, true, 'must classify as timeout, never let gmgnJson attempt to parse stale stdout as MALFORMED_OUTPUT');
+      return true;
+    },
+  );
+});
+
+test('escalation: timeout never becomes a non-zero-exit error', async () => {
+  const fake = makeFakeChild(() => 'ignore');
+  setTimeout(() => fake.emitClose(1, null), 40);
+  await assert.rejects(
+    () => runWithFakeChild(fake, { timeoutMs: 30 }),
+    (err: NodeJS.ErrnoException & { killed?: boolean; code?: unknown }) => {
+      assert.equal(err.killed, true, 'must classify as timeout, not NONZERO_EXIT, once timeout was already declared');
+      return true;
+    },
+  );
+});
+
+test('gmgnJson: a timeout from the real escalation path classifies as GMGN_CLI_TIMEOUT end to end', async () => {
+  const fake = makeFakeChild(() => 'ignore');
+  await assert.rejects(
+    () =>
+      gmgnJson(['market', 'trending'], {
+        timeoutMs: 30,
+        runner: (file, args, o) => runGmgnProcess(file, args, { ...o, spawnFn: () => fake.child }),
+      }),
+    (err: GmgnError) => {
+      assert.equal(err.code, 'GMGN_CLI_TIMEOUT');
+      return true;
+    },
+  );
+}, { timeout: 8_000 });
+
+// ── Real OS process (§10): genuine end-to-end escalation coverage ────────
+
+test('real OS process: a child that truly ignores SIGTERM is terminated and reported as timeout', async () => {
+  const fixture = path.join(FIXTURES_DIR, 'ignore-sigterm.mjs');
+  let capturedPid: number | undefined;
+
+  const start = Date.now();
+  await assert.rejects(
+    () =>
+      runGmgnProcess(NODE, [fixture], {
+        timeoutMs: 300,
+        maxBufferBytes: 1024 * 1024,
+        env: process.env,
+        spawnFn: (file, args, env) => {
+          const real = crossSpawn(file, args, { env });
+          capturedPid = real.pid;
+          return real as unknown as SpawnedProcess;
+        },
+      }),
+    (err: NodeJS.ErrnoException & { killed?: boolean }) => {
+      assert.equal(err.killed, true);
+      return true;
+    },
+  );
+  const elapsedMs = Date.now() - start;
+  // Generous bound: timeoutMs(300) + grace(2000) + kill-wait(2000) + slack,
+  // covering the POSIX worst case where SIGTERM is genuinely ignored and
+  // SIGKILL is required. On Windows this resolves much faster, since any
+  // kill() call there already terminates unconditionally.
+  assert.ok(elapsedMs < 9_000, `escalation must be bounded even for a genuinely unresponsive real process (took ${elapsedMs}ms)`);
+
+  assert.ok(capturedPid, 'sanity check: a real PID was captured');
+  // Confirm the real OS process is actually gone (no orphan left behind).
+  // Signal 0 performs no actual signal delivery — it only checks whether
+  // the process still exists (POSIX and Windows both support this via
+  // Node's process.kill).
+  await new Promise((r) => setTimeout(r, 200)); // let the OS finish reaping it
+  assert.throws(
+    () => process.kill(capturedPid!, 0),
+    /ESRCH|no such process/i,
+    'the real child process must no longer exist after the wrapper settles',
+  );
+}, { timeout: 15_000 });

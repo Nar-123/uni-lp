@@ -42,13 +42,22 @@ const { __resetMultiCooldownForTests } = await import('../src/strategy/multiRisk
  * same on-disk DB_PATH file — it does not clear it. Delete the file too so
  * each test gets a genuinely empty store (open positions / journal entries
  * must not leak across cases in this suite).
+ *
+ * Phase 4.6.1: persist() now also maintains `<path>.bak` (previous
+ * generation) and, transiently, `<path>.tmp` sidecars for crash recovery.
+ * Deleting only the primary is no longer enough to get a genuinely empty
+ * store on the next load() — load() will correctly (and, outside tests,
+ * desirably) recover from `.bak` instead of starting empty. Tests want the
+ * opposite of crash recovery here, so all three must be removed.
  */
 function resetDb(): void {
   __resetStoreForTests();
-  try {
-    fs.rmSync(process.env.DB_PATH!, { force: true });
-  } catch {
-    /* ignore */
+  for (const suffix of ['', '.bak', '.tmp']) {
+    try {
+      fs.rmSync(`${process.env.DB_PATH!}${suffix}`, { force: true });
+    } catch {
+      /* ignore */
+    }
   }
 }
 

@@ -34,6 +34,16 @@ export type JournalAccountingMeta = {
   /** null = USD unknown at staging time — RECONCILIATION_REQUIRED on recovery */
   usd: number | null;
   feeSplitIsEstimated?: boolean;
+  /**
+   * Phase 4.5.2: which strategy staged this entry (e.g. 'multi'). Omitted
+   * for manual mints. Carried through so a ledger event reconstructed by
+   * Phase 3.5 recovery (pnl/reconcile.ts) after a crash keeps the same
+   * strategy attribution the immediate recordLedger() call would have
+   * set — without this, a recovered MULTI-originated ledger row would
+   * silently lose its 'multi' tag and become indistinguishable from
+   * manual activity in PnL-by-strategy reporting.
+   */
+  strategy?: string;
 };
 
 export type DepositMode = 'auto' | 'wrapped' | 'stable';
@@ -470,15 +480,170 @@ type Store = {
 let store: Store | null = null;
 let storePath = '';
 
+/**
+ * Phase 4.6.1 — crash-safe persistence.
+ *
+ * The store is written via a write-temp-then-rename sequence (see
+ * `persist()`) and a rotating single-generation backup (`<path>.bak`,
+ * always the previous fully-committed generation, itself only ever
+ * produced by a prior atomic rename — never a partial write). On load,
+ * three sidecar files may exist next to the primary:
+ *   `<path>.tmp` — a fully-written, fsynced new generation that hadn't yet
+ *                  been promoted to primary when the process died.
+ *   `<path>.bak` — the previous generation, moved aside right before the
+ *                  new one was installed.
+ *   `<path>.corrupt-<timestamp>` — a primary file this process found
+ *                  unparseable and quarantined (never deleted) for
+ *                  operator diagnosis.
+ * Recovery preference when the primary is missing or corrupt is always
+ * "most recent complete state first": `.tmp` (the newest fully-flushed
+ * write) before `.bak` (one generation stale). A corrupt/absent primary
+ * with no usable `.tmp`/`.bak` is a hard failure — this never falls back
+ * to an empty store, since that would silently erase financial history
+ * (crash-safety invariant B).
+ */
+function isValidStoreShape(v: unknown): v is Store {
+  return (
+    !!v &&
+    typeof v === 'object' &&
+    Array.isArray((v as Store).positions) &&
+    Array.isArray((v as Store).ledger)
+  );
+}
+
+/** Read + parse a candidate store file. Returns null (never throws) on any
+ * missing-file, read, or parse error, or if the parsed JSON doesn't look
+ * like a Store — callers decide what "null" means in context. */
+function tryReadStoreFile(candidatePath: string): Store | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(candidatePath, 'utf8');
+  } catch {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    console.error(
+      `[db] ${candidatePath} exists but is not valid JSON: ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return null;
+  }
+  if (!isValidStoreShape(parsed)) {
+    console.error(`[db] ${candidatePath} parsed but does not look like a valid store (missing positions/ledger arrays)`);
+    return null;
+  }
+  return parsed;
+}
+
+/** Move a file aside for diagnosis instead of ever deleting/overwriting it. */
+function quarantineFile(candidatePath: string): string | null {
+  try {
+    if (!fs.existsSync(candidatePath)) return null;
+    const quarantined = `${candidatePath}.corrupt-${Date.now()}`;
+    fs.renameSync(candidatePath, quarantined);
+    return quarantined;
+  } catch (e) {
+    console.error(`[db] failed to quarantine ${candidatePath}: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+
+/** Try `.tmp` (most recent complete write) then `.bak` (previous generation). */
+function recoverFromSidecars(primaryPath: string): Store | null {
+  const tmpPath = `${primaryPath}.tmp`;
+  const bakPath = `${primaryPath}.bak`;
+
+  const fromTmp = tryReadStoreFile(tmpPath);
+  if (fromTmp) {
+    console.error(
+      `[db] RECOVERED primary store from ${tmpPath} (a write that completed but was not yet promoted). ` +
+        `RECONCILIATION RECOMMENDED — verify recent activity via /reconcile.`,
+    );
+    return fromTmp;
+  }
+
+  const fromBak = tryReadStoreFile(bakPath);
+  if (fromBak) {
+    console.error(
+      `[db] RECOVERED primary store from ${bakPath} (the previous generation — this is ` +
+        `at most one save behind the true last state). RECONCILIATION REQUIRED — run /reconcile ` +
+        `and cross-check the most recent transaction(s) against on-chain history.`,
+    );
+    return fromBak;
+  }
+
+  return null;
+}
+
 function load(): Store {
   if (store) return store;
   storePath = path.resolve(config.dbPath.replace(/\.db$/i, '.json'));
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
+  const tmpPath = `${storePath}.tmp`;
+  const bakPath = `${storePath}.bak`;
+
   if (fs.existsSync(storePath)) {
-    store = JSON.parse(fs.readFileSync(storePath, 'utf8')) as Store;
+    const parsed = tryReadStoreFile(storePath);
+    if (parsed) {
+      store = parsed;
+      // A leftover .tmp here means a prior persist() completed the write
+      // but crashed/failed before or during the rename that installs it —
+      // the primary we just loaded is already the authoritative state
+      // (either that same generation, if the rename actually succeeded, or
+      // an earlier one), so the stray tmp is superseded. Best-effort clean
+      // up only; never let this block startup.
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {
+        /* non-fatal */
+      }
+    } else {
+      // Primary exists but is corrupt/unparseable. Preserve it for
+      // diagnosis (never delete/overwrite it) and attempt deterministic
+      // recovery from a sidecar before giving up.
+      const quarantined = quarantineFile(storePath);
+      const recovered = recoverFromSidecars(storePath);
+      if (!recovered) {
+        throw new Error(
+          `[db] FATAL: primary store ${storePath} is corrupt` +
+            (quarantined ? ` (preserved at ${quarantined})` : '') +
+            ` and no usable backup/temp state was found. Refusing to start with an invented ` +
+            `empty ledger/journal — this would silently erase financial history. Manual ` +
+            `recovery required: inspect the quarantined file and any *.bak/*.tmp files next ` +
+            `to ${storePath}.`,
+        );
+      }
+      store = recovered;
+      // Immediately re-commit the recovered state to the primary path via
+      // the normal atomic path, so subsequent loads see it there too.
+      persist();
+    }
   } else {
-    store = { positions: [], ledger: [], nextLedgerId: 1, prefs: {} };
-    persist();
+    // No primary file. This is legitimate on a genuine first run, but it's
+    // also exactly what a crash between the two renames in persist() would
+    // leave behind — so check the sidecars before assuming "first run".
+    const recovered = recoverFromSidecars(storePath);
+    if (recovered) {
+      store = recovered;
+      persist();
+    } else if (fs.existsSync(tmpPath) || fs.existsSync(bakPath)) {
+      // A sidecar exists but neither is readable — this is corruption, not
+      // an empty first run. Fail loud rather than inventing a fresh store.
+      const badTmp = fs.existsSync(tmpPath) ? quarantineFile(tmpPath) : null;
+      const badBak = fs.existsSync(bakPath) ? quarantineFile(bakPath) : null;
+      throw new Error(
+        `[db] FATAL: primary store ${storePath} is missing and the only recovery ` +
+          `candidates found were unreadable/corrupt` +
+          (badTmp ? ` (preserved at ${badTmp})` : '') +
+          (badBak ? ` (preserved at ${badBak})` : '') +
+          `. Refusing to start with an invented empty ledger/journal.`,
+      );
+    } else {
+      store = { positions: [], ledger: [], nextLedgerId: 1, prefs: {} };
+      persist();
+    }
   }
   if (!store.prefs) store.prefs = {};
   if (!store.execution_telemetry) store.execution_telemetry = [];
@@ -690,9 +855,105 @@ export function setPositionLabel(
   }
 }
 
+/**
+ * Best-effort directory fsync so the rename below is durable against a
+ * following power loss, not just crash-consistent against a process kill.
+ * Not supported the same way on every platform (Windows does not expose
+ * directory-fd fsync via Node's fs API the way POSIX does) — this is
+ * intentionally best-effort and silent on unsupported platforms rather
+ * than pretending a guarantee it can't make there.
+ */
+function fsyncDirBestEffort(dirPath: string): void {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(dirPath, 'r');
+    fs.fsyncSync(fd);
+  } catch {
+    // Expected on platforms/filesystems that don't support opening a
+    // directory for fsync (notably Windows) — no durability regression
+    // versus before this phase, since the previous code never attempted
+    // this at all; the file-level fsync in persist() below still applies.
+  } finally {
+    if (fd != null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* already closed / nothing more to do */
+      }
+    }
+  }
+}
+
+/**
+ * Crash-safe write: serialize -> write+fsync a temp file in the SAME
+ * directory -> rotate the current primary to `.bak` -> atomically rename
+ * the temp file over the primary. Every step that can fail throws
+ * explicitly (never silently reports success on a failed write — crash-
+ * safety invariant A) except the `.bak` rotation, which is a best-effort
+ * safety net: failing to rotate the backup must not block installing the
+ * new state, since the atomic rename immediately below is what actually
+ * provides the durability/atomicity guarantee.
+ *
+ * The temp file is never the target path itself, the target is never
+ * truncated in place, and the target is never deleted before its
+ * replacement is ready — at every point before the final rename, a
+ * concurrent reader (or a crash) sees either the complete old primary or
+ * nothing changed yet; at every point after, it sees the complete new
+ * primary. There is no window where the primary is partially written
+ * (crash-safety invariant F).
+ */
 function persist(): void {
   if (!store) return;
-  fs.writeFileSync(storePath, JSON.stringify(store, null, 2));
+  const data = JSON.stringify(store, null, 2);
+  const tmpPath = `${storePath}.tmp`;
+  const bakPath = `${storePath}.bak`;
+
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(tmpPath, 'w');
+    fs.writeSync(fd, data, 0, 'utf8');
+    fs.fsyncSync(fd);
+  } catch (e) {
+    throw new Error(
+      `[db] persist: failed to write temp file ${tmpPath} — existing state on disk is unchanged: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    );
+  } finally {
+    if (fd != null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* already closed */
+      }
+    }
+  }
+
+  try {
+    if (fs.existsSync(storePath)) {
+      fs.renameSync(storePath, bakPath);
+    }
+  } catch (e) {
+    console.error(
+      `[db] persist: backup rotation failed (continuing — this only reduces the recovery ` +
+        `sidecar's freshness, it does not block installing the new state): ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+    );
+  }
+
+  try {
+    fs.renameSync(tmpPath, storePath);
+  } catch (e) {
+    throw new Error(
+      `[db] persist: failed to install new state — the fully-written new generation is at ` +
+        `${tmpPath} and can be recovered from there on next start: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+    );
+  }
+
+  fsyncDirBestEffort(path.dirname(storePath));
 }
 
 /** Initialize store (call on boot). */

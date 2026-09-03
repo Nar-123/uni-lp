@@ -37,6 +37,7 @@ import {
   type MinimalReadClient,
 } from './quote.js';
 import { estimateWriteGas } from './gas.js';
+import { EXECUTION_RECEIPT_TIMEOUT_MS } from './receiptWait.js';
 
 /** SwapRouter02 exactInputSingle / exactInput (no deadline field) — Uniswap */
 const swapRouter02Abi = [
@@ -383,7 +384,7 @@ async function ensureAllowance(
     account: wallet.account!,
     chain: wallet.chain,
   });
-  await client.waitForTransactionReceipt({ hash });
+  await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
 }
 
 export async function previewSwapToNative(
@@ -783,7 +784,7 @@ export async function swapTokenToNative(
                 chain: wallet.chain,
                 gas: gasPcsMulti,
               });
-              const receipt = await client.waitForTransactionReceipt({ hash });
+              const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
               if (receipt.status !== 'success') throw new Error(`Swap tx reverted: ${hash}`);
               console.log(`[swap] ok multi PCS via ${route.midSymbol} minOut=${minOut} round=${round}`);
               return {
@@ -819,7 +820,7 @@ export async function swapTokenToNative(
               chain: wallet.chain,
               gas: gasUniMulti,
             });
-            const receipt = await client.waitForTransactionReceipt({ hash });
+            const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
             if (receipt.status !== 'success') throw new Error(`Swap tx reverted: ${hash}`);
             console.log(`[swap] ok multi via ${route.midSymbol} minOut=${minOut} round=${round}`);
             return {
@@ -921,7 +922,7 @@ export async function swapTokenToNative(
                 chain: wallet.chain,
                 gas: gasPcsDirect,
               });
-              const receipt = await client.waitForTransactionReceipt({ hash });
+              const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
               if (receipt.status !== 'success') {
                 throw new Error(`Swap tx reverted: ${hash}`);
               }
@@ -961,7 +962,7 @@ export async function swapTokenToNative(
               chain: wallet.chain,
               gas: gasUniDirect,
             });
-            const receipt = await client.waitForTransactionReceipt({ hash });
+            const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
             if (receipt.status !== 'success') {
               throw new Error(`Swap tx reverted: ${hash}`);
             }
@@ -1055,7 +1056,7 @@ export async function swapTokenToNative(
                   gas: gasUniSingle,
                 });
               }
-              const r1 = await client.waitForTransactionReceipt({ hash: hash1 });
+              const r1 = await client.waitForTransactionReceipt({ hash: hash1, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
               if (r1.status !== 'success') throw new Error(`single swap reverted ${hash1}`);
 
               const wbal = await client.readContract({
@@ -1073,7 +1074,7 @@ export async function swapTokenToNative(
                   account: wallet.account!,
                   chain: wallet.chain,
                 });
-                await client.waitForTransactionReceipt({ hash: hash2 });
+                await client.waitForTransactionReceipt({ hash: hash2, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
               }
               console.log(`[swap] ok single ${pDex} fee=${p.fee} minOut=${minOut} round=${round}`);
               return {
@@ -1500,7 +1501,7 @@ async function swapExactInLocal(
                 chain: wallet.chain,
                 gas: gasPcsMulti,
               });
-              const receipt = await client.waitForTransactionReceipt({ hash });
+              const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
               if (receipt.status !== 'success') throw new Error(`swap reverted ${hash}`);
               console.log(
                 `[swapExactIn] PCS multi ${metaIn.symbol}→${route.midSymbol}→${metaOut.symbol} ` +
@@ -1542,7 +1543,7 @@ async function swapExactInLocal(
               chain: wallet.chain,
               gas: gasUniMulti,
             });
-            const receipt = await client.waitForTransactionReceipt({ hash });
+            const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
             if (receipt.status !== 'success') throw new Error(`swap reverted ${hash}`);
             console.log(
               `[swapExactIn] multi ${metaIn.symbol}→${route.midSymbol}→${metaOut.symbol} ` +
@@ -1590,7 +1591,7 @@ async function swapExactInLocal(
               chain: wallet.chain,
               gas: gasPcsSingle,
             });
-            const receipt = await client.waitForTransactionReceipt({ hash });
+            const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
             if (receipt.status !== 'success') throw new Error(`swap reverted ${hash}`);
             console.log(
               `[swapExactIn] PCS ${metaIn.symbol}→${metaOut.symbol} fee=${route.fee} min=${minOut} round=${round}`,
@@ -1635,7 +1636,7 @@ async function swapExactInLocal(
             chain: wallet.chain,
             gas: gasUniSingle,
           });
-          const receipt = await client.waitForTransactionReceipt({ hash });
+          const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
           if (receipt.status !== 'success') throw new Error(`swap reverted ${hash}`);
           console.log(
             `[swapExactIn] ${metaIn.symbol}→${metaOut.symbol} fee=${route.fee} min=${minOut} round=${round}`,

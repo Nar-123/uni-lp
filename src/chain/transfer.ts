@@ -10,6 +10,7 @@ import { getHotWalletAddress, getPublicClient, getWalletClient } from './clients
 import { erc20Abi } from './abis.js';
 import { formatUnits, getTokenBalance, getTokenMeta } from './tokens.js';
 import { GAS_RESERVE_WEI } from './wrap.js';
+import { EXECUTION_RECEIPT_TIMEOUT_MS } from './receiptWait.js';
 
 export type TransferAsset = 'native' | Address;
 
@@ -71,7 +72,7 @@ export async function transferBetweenWallets(params: {
       value: amount,
       chain: wallet.chain,
     });
-    await publicClient.waitForTransactionReceipt({ hash });
+    await publicClient.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
     return {
       hash,
       chainId,
@@ -111,7 +112,7 @@ export async function transferBetweenWallets(params: {
     data,
     chain: wallet.chain,
   });
-  await publicClient.waitForTransactionReceipt({ hash });
+  await publicClient.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
 
   return {
     hash,

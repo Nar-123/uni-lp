@@ -23,6 +23,7 @@ import { withTxLock } from './txLock.js';
 import {
   classifyBroadcastError,
   markNoRetry,
+  recoverUnresolvedEntries,
   resolveAmbiguousTx,
   type MinimalNonceClient,
   type MinimalReceiptClient,
@@ -131,22 +132,31 @@ async function journalledSend<Args extends unknown[]>(
 
   const unresolved = listUnresolvedTxJournal({ chainId, wallet: walletAddress });
   if (unresolved.length > 0) {
-    for (const entry of unresolved) {
-      try {
-        const outcome = await resolveAmbiguousTx(recoveryClient, {
-          txHash: entry.txHash as Hex | null,
-          nonce: entry.nonce,
-          wallet: walletAddress,
-        });
+    // Phase 4.6.3: each entry's recovery check is resolved CONCURRENTLY
+    // (see recoverUnresolvedEntries's own doc comment) instead of one at a
+    // time — with a slow/flaky RPC, N unresolved entries no longer turn
+    // into an O(N) sequential stall before this send can even be attempted.
+    // Classification, journal-write conditions, and per-entry error
+    // isolation are byte-for-byte the same as before; only the concurrency
+    // of the underlying read-only RPC calls changed. An entry whose check
+    // itself throws (or times out) is still left unresolved, never marked
+    // resolved by another entry's success.
+    await recoverUnresolvedEntries(
+      unresolved.map((entry) => ({
+        id: entry.id,
+        chainId: entry.chainId,
+        action: entry.action,
+        txHash: entry.txHash as Hex | null,
+        nonce: entry.nonce,
+        wallet: walletAddress,
+      })),
+      () => recoveryClient,
+      (id, outcome) => {
         if (outcome !== 'SUBMITTED') {
-          updateTxJournalEntry(entry.id, {
-            state: outcome === 'CONFIRMED' ? 'CONFIRMED' : outcome,
-          });
+          updateTxJournalEntry(id, { state: outcome === 'CONFIRMED' ? 'CONFIRMED' : outcome });
         }
-      } catch (e) {
-        console.error(`[tx-recovery] pre-send recovery attempt failed for #${entry.id}:`, e);
-      }
-    }
+      },
+    );
     const stillUnresolved = listUnresolvedTxJournal({ chainId, wallet: walletAddress });
     if (stillUnresolved.length > 0) {
       throw new Error(

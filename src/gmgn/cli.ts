@@ -102,6 +102,35 @@ type CliProcessError = Error & {
 };
 
 /**
+ * Phase 4.6.2: bounded SIGTERM→SIGKILL escalation. A child that ignores
+ * SIGTERM must not stay alive (and must not leave this wrapper's promise
+ * unsettled) indefinitely. Both windows are short relative to
+ * DEFAULT_TIMEOUT_MS (30s) — they only ever add latency on an already-
+ * failing call, never on the happy path.
+ */
+const SIGTERM_GRACE_MS = 2_000;
+/** Final bound after SIGKILL: settle even if the OS hasn't reaped the process yet, so the wrapper's own contract ("must not hang the caller") holds regardless of OS-level cleanup timing. */
+const SIGKILL_WAIT_MS = 2_000;
+
+/**
+ * Minimal shape of a spawned child process this wrapper depends on —
+ * lets tests inject a fully-controlled fake "child" to deterministically
+ * and portably exercise the exact SIGTERM→SIGKILL escalation sequence
+ * (real OS signal semantics differ enough between POSIX and Windows —
+ * e.g. Windows has no real "ignore a signal" capability — that the exact
+ * escalation *logic* is better proven this way, alongside a separate
+ * real-OS-process test for genuine end-to-end coverage; see
+ * test/gmgnCli.test.ts).
+ */
+export type SpawnedProcess = {
+  stdout: NodeJS.ReadableStream | null;
+  stderr: NodeJS.ReadableStream | null;
+  on(event: 'error', listener: (err: CliProcessError) => void): unknown;
+  on(event: 'close', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+  kill(signal: NodeJS.Signals): boolean;
+};
+
+/**
  * Cross-platform process runner for gmgn-cli, replacing Node's raw
  * `execFile()` (see security rule 1). Mirrors `execFile`'s well-known
  * error shape (`.code`, `.killed`, `.signal`, `.stdout`, `.stderr`) so the
@@ -111,30 +140,85 @@ type CliProcessError = Error & {
 export function runGmgnProcess(
   file: string,
   args: string[],
-  opts: { timeoutMs: number; maxBufferBytes: number; env: NodeJS.ProcessEnv },
+  opts: {
+    timeoutMs: number;
+    maxBufferBytes: number;
+    env: NodeJS.ProcessEnv;
+    /** Test-only injection point; defaults to the real cross-spawn call. */
+    spawnFn?: (file: string, args: string[], env: NodeJS.ProcessEnv) => SpawnedProcess;
+  },
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = crossSpawn(file, args, { env: opts.env });
+    const spawnFn = opts.spawnFn ?? ((f, a, e) => crossSpawn(f, a, { env: e }) as unknown as SpawnedProcess);
+    const child = spawnFn(file, args, opts.env);
     let stdout = '';
     let stderr = '';
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let settled = false;
     let timedOut = false;
+    let processExited = false;
 
-    const timer = setTimeout(() => {
+    let sigtermTimer: ReturnType<typeof setTimeout> | null = setTimeout(onTimeout, opts.timeoutMs);
+    let sigkillGraceTimer: ReturnType<typeof setTimeout> | null = null;
+    let sigkillWaitTimer: ReturnType<typeof setTimeout> | null = null;
+
+    function clearAllTimers(): void {
+      if (sigtermTimer) clearTimeout(sigtermTimer);
+      if (sigkillGraceTimer) clearTimeout(sigkillGraceTimer);
+      if (sigkillWaitTimer) clearTimeout(sigkillWaitTimer);
+      sigtermTimer = sigkillGraceTimer = sigkillWaitTimer = null;
+    }
+
+    // Never let a signal delivery race (process already exited between our
+    // liveness check and this call) surface as an unexpected/fatal error —
+    // ChildProcess#kill() throwing here means only "there's nothing left to
+    // kill", which is a success condition for our purposes, not a failure.
+    function safeKill(signal: NodeJS.Signals): void {
+      try {
+        child.kill(signal);
+      } catch {
+        /* already gone — nothing to do */
+      }
+    }
+
+    function timeoutError(): CliProcessError {
+      return Object.assign(new Error(`gmgn-cli timed out after ${opts.timeoutMs}ms`), {
+        killed: true,
+        signal: 'SIGTERM' as const,
+        code: null,
+      });
+    }
+
+    function onTimeout(): void {
       timedOut = true;
-      child.kill('SIGTERM');
-    }, opts.timeoutMs);
+      safeKill('SIGTERM');
+      // SIGKILL is uncatchable on POSIX, so a child that ignores SIGTERM
+      // cannot ignore this escalation. On Windows there is no real signal
+      // delivery — any kill() call already terminates the process
+      // unconditionally (TerminateProcess) regardless of the signal name,
+      // so this second call is a harmless no-op there if the first already
+      // succeeded, and a safety net if it somehow didn't.
+      sigkillGraceTimer = setTimeout(() => {
+        if (processExited) return;
+        safeKill('SIGKILL');
+        sigkillWaitTimer = setTimeout(() => finish(timeoutError()), SIGKILL_WAIT_MS);
+      }, SIGTERM_GRACE_MS);
+    }
 
     const finish = (err: CliProcessError | null) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearAllTimers();
       if (err) {
-        err.stdout = stdout;
-        err.stderr = stderr;
-        reject(err);
+        // Once a timeout has been declared, it is the final result — a
+        // later/different error (e.g. a stream error racing the kill
+        // escalation) must never override it with a raw, unclassified
+        // error.
+        const finalErr = timedOut ? timeoutError() : err;
+        finalErr.stdout = stdout;
+        finalErr.stderr = stderr;
+        reject(finalErr);
       } else {
         resolve({ stdout, stderr });
       }
@@ -143,7 +227,7 @@ export function runGmgnProcess(
     child.stdout?.on('data', (chunk: Buffer) => {
       stdoutBytes += chunk.length;
       if (stdoutBytes > opts.maxBufferBytes) {
-        child.kill('SIGTERM');
+        safeKill('SIGTERM');
         finish(Object.assign(new Error('gmgn-cli stdout exceeded maxBuffer'), { code: 'ERR_MAXBUFFER' }));
         return;
       }
@@ -152,7 +236,7 @@ export function runGmgnProcess(
     child.stderr?.on('data', (chunk: Buffer) => {
       stderrBytes += chunk.length;
       if (stderrBytes > opts.maxBufferBytes) {
-        child.kill('SIGTERM');
+        safeKill('SIGTERM');
         finish(Object.assign(new Error('gmgn-cli stderr exceeded maxBuffer'), { code: 'ERR_MAXBUFFER' }));
         return;
       }
@@ -162,12 +246,9 @@ export function runGmgnProcess(
     child.on('error', (err: CliProcessError) => finish(err));
 
     child.on('close', (code, signal) => {
+      processExited = true;
       if (timedOut) {
-        finish(Object.assign(new Error(`gmgn-cli timed out after ${opts.timeoutMs}ms`), {
-          killed: true,
-          signal: signal ?? 'SIGTERM',
-          code,
-        }));
+        finish(timeoutError());
         return;
       }
       if (code !== 0) {

@@ -59,6 +59,22 @@ export function computeSingleSidedRange(params: {
     edgeBufferPercent = 0,
   } = params;
 
+  // Fail closed on malformed pool state instead of silently misbehaving:
+  // a non-finite currentTick previously caused the tickLower-search loop
+  // below to spin forever (Infinity <= Infinity never becomes false), and
+  // a NaN currentTick silently propagated through every subsequent
+  // comparison (NaN comparisons are always false, so guards like
+  // `tickLower >= tickUpper` never fired) all the way out to a reported
+  // `valid: true` with NaN ticks. Both are caught here, before any loop
+  // or comparison runs. This never rejects a real pool's tick (always a
+  // finite int24) or a real tickSpacing (always a finite positive int) —
+  // only genuinely malformed/corrupted input.
+  if (!Number.isFinite(currentTick)) {
+    throw new Error(`computeSingleSidedRange: currentTick must be finite, got ${currentTick}`);
+  }
+  if (!Number.isFinite(tickSpacing) || tickSpacing <= 0) {
+    throw new Error(`computeSingleSidedRange: tickSpacing must be a finite positive number, got ${tickSpacing}`);
+  }
   if (widthPercent <= 0 || widthPercent >= 100) {
     throw new Error('widthPercent must be between 0 and 100 exclusive');
   }

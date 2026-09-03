@@ -34,6 +34,7 @@ import {
   RELAY_NATIVE,
 } from './relay.js';
 import { getNativeBalance, GAS_RESERVE_WEI } from './wrap.js';
+import { EXECUTION_RECEIPT_TIMEOUT_MS } from './receiptWait.js';
 
 export const ACROSS_API = 'https://app.across.to/api';
 
@@ -336,7 +337,7 @@ async function sendAndWait(
     ...(tx.gas != null && tx.gas > 0n ? { gas: tx.gas } : {}),
   });
   onProgress?.(`Waiting receipt ${hash.slice(0, 12)}…`);
-  const receipt = await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   if (receipt.status === 'reverted') {
     throw new Error(`Tx reverted: ${hash}`);
   }

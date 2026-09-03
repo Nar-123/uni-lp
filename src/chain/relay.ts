@@ -26,6 +26,7 @@ import { formatUnits, humanToRaw, parsePercentOfBalance } from './tokens.js';
 import { getNativeBalance, getWrappableNative, GAS_RESERVE_WEI } from './wrap.js';
 import { sleep } from './retry.js';
 import { erc20Abi } from './abis.js';
+import { EXECUTION_RECEIPT_TIMEOUT_MS } from './receiptWait.js';
 
 export const RELAY_API = 'https://api.relay.link';
 /** Zero address = native gas token on Relay */
@@ -437,7 +438,7 @@ async function executeTransactionItem(
         : await wallet.sendTransaction(base);
 
   onProgress?.(`Waiting receipt ${hash.slice(0, 12)}…`);
-  const receipt = await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   if (receipt.status === 'reverted') {
     throw new Error(`Tx reverted: ${hash}`);
   }

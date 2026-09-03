@@ -12,6 +12,25 @@ function cooldownKey(chainId: number, tokenAddress: string): string {
   return `${chainId}:${tokenAddress.toLowerCase()}`;
 }
 
+/**
+ * Phase 4.6.8: every successful MULTI entry adds one permanent key to
+ * `cooldownMap` that this codebase previously never removed — over weeks of
+ * continuous operation (MULTI typically enters a different meme token each
+ * time), the map's key count grows with the lifetime count of distinct
+ * tokens ever entered, not with anything currently relevant. An entry whose
+ * cooldown window has already elapsed can never again affect
+ * checkEntryCooldown's result (see the `< config.entryCooldownMs` check
+ * below), so it is safe to drop — purely a memory bound, not a behavior
+ * change. Mirrors the same prune-on-tick idiom already used by
+ * volumeAlertWatcher.ts's `pruneCooldowns`.
+ */
+function pruneCooldownMap(maxAgeMs: number): void {
+  const cutoff = Date.now() - maxAgeMs;
+  for (const [key, at] of cooldownMap) {
+    if (at < cutoff) cooldownMap.delete(key);
+  }
+}
+
 /** Any open position (any strategy) already holding this token on this chain blocks a new MULTI entry. */
 export function checkDoubleEntry(
   chainId: SupportedChainId,
@@ -44,11 +63,28 @@ export function checkPositionLimits(
     return { pass: false, reason: 'POSITION_LIMIT' };
   }
 
+  // Phase 4.7 fix: a missing/not-yet-written position-meta row must fail
+  // closed. It previously contributed $0 to the exposure sum (`?? 0`) —
+  // exactly backwards, since lost accounting data silently permitted MORE
+  // trading, not less. `config.positionSizeUsd` (the configured fixed
+  // position size) is the best available worst-case estimate for a
+  // metadata-less position; falling back to it, not to 0, keeps the cap
+  // meaningful even when a meta write was lost to a crash window
+  // (multiExecute.ts's recordMultiPositionMeta lands after several awaits).
   const exposureUsd = openMulti.reduce((sum, p) => {
     const meta = getMultiPositionMeta(p.chainId, p.tokenId);
-    return sum + (meta?.positionSizeUsd ?? 0);
+    return sum + (meta?.positionSizeUsd ?? config.positionSizeUsd ?? 0);
   }, 0);
-  if (exposureUsd >= config.maxExposureUsd) {
+  // Phase 4.7 fix: include the position about to be opened, not only
+  // already-open ones — otherwise the cap only ever fires *after* it has
+  // already been exceeded by up to one more position's size. Only possible
+  // for fixed-USD sizing (config.positionSizeUsd set): percent-of-balance
+  // sizing has no fixed USD figure available pre-mint (it depends on live
+  // wallet balance and live USDG price at mint time), so the incremental
+  // add is a no-op in that mode — a known, documented residual limitation
+  // distinct from the two bugs fixed here.
+  const incomingUsd = config.positionSizeUsd ?? 0;
+  if (exposureUsd + incomingUsd >= config.maxExposureUsd) {
     return { pass: false, reason: 'POSITION_LIMIT' };
   }
 
@@ -60,6 +96,7 @@ export function checkEntryCooldown(
   tokenAddress: string,
   config: MultiConfig,
 ): RiskGateResult {
+  pruneCooldownMap(config.entryCooldownMs);
   const last = cooldownMap.get(cooldownKey(chainId, tokenAddress));
   if (last != null && Date.now() - last < config.entryCooldownMs) {
     return { pass: false, reason: 'ENTRY_COOLDOWN' };
@@ -74,6 +111,19 @@ export function recordEntryCooldown(chainId: SupportedChainId, tokenAddress: str
 
 export function __resetMultiCooldownForTests(): void {
   cooldownMap.clear();
+}
+
+/** Test-only: insert a cooldown entry with an explicit (possibly backdated) timestamp. */
+export function __setCooldownEntryForTests(
+  chainId: number,
+  tokenAddress: string,
+  at: number,
+): void {
+  cooldownMap.set(cooldownKey(chainId, tokenAddress), at);
+}
+
+export function __cooldownMapSizeForTests(): number {
+  return cooldownMap.size;
 }
 
 /** Any unresolved (non-final) journal entry on this chain blocks a new MULTI send. */

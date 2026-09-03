@@ -129,6 +129,58 @@ test('2: recoverMissingLedger auto-creates the ledger event from journal account
   assert.equal(row!.amountHuman, 0.05);
 });
 
+test('2b: recovered ledger event preserves the staged strategy tag (Phase 4.5.2 fix — a MULTI position must not lose attribution across a crash)', () => {
+  const tokenId = freshToken();
+  const txHash = freshTx();
+
+  const jId = createTxJournalEntry({ chainId: CHAIN, wallet: WALLET, nonce: 2, action: 'writeContract:mint' });
+  updateTxJournalEntry(jId, { state: 'SUBMITTED', tx_hash: txHash });
+  updateTxJournalEntry(jId, { state: 'CONFIRMED' });
+
+  setJournalAccountingMeta(CHAIN, txHash, [{
+    kind: 'deposit',
+    tokenId,
+    tokenAddress: null,
+    amountRaw: null,
+    amountHuman: 100,
+    usd: 100,
+    strategy: 'multi',
+  }]);
+
+  const report = recoverMissingLedger(CHAIN);
+  assert.equal(report.recovered, 1);
+
+  const rows = getLedgerEntries(CHAIN, tokenId, 'deposit');
+  const row = rows.find((r) => r.txHash?.toLowerCase() === txHash.toLowerCase());
+  assert.ok(row, 'ledger event created for the confirmed deposit');
+  assert.equal(row!.strategy, 'multi', 'recovery must not silently drop the strategy attribution');
+});
+
+test('2c: a manual (no strategy) entry recovers with strategy still undefined — unaffected by the fix', () => {
+  const tokenId = freshToken();
+  const txHash = freshTx();
+
+  const jId = createTxJournalEntry({ chainId: CHAIN, wallet: WALLET, nonce: 2, action: 'writeContract:mint' });
+  updateTxJournalEntry(jId, { state: 'SUBMITTED', tx_hash: txHash });
+  updateTxJournalEntry(jId, { state: 'CONFIRMED' });
+
+  setJournalAccountingMeta(CHAIN, txHash, [{
+    kind: 'deposit',
+    tokenId,
+    tokenAddress: null,
+    amountRaw: null,
+    amountHuman: 100,
+    usd: 100,
+    // no strategy field — matches every existing manual bot.ts call site
+  }]);
+
+  recoverMissingLedger(CHAIN);
+  const rows = getLedgerEntries(CHAIN, tokenId, 'deposit');
+  const row = rows.find((r) => r.txHash?.toLowerCase() === txHash.toLowerCase());
+  assert.ok(row);
+  assert.equal(row!.strategy, undefined);
+});
+
 // ── 3. Recovery idempotency ──────────────────────────────────────────────────
 
 test('3: calling recoverMissingLedger twice does not create duplicate ledger events', () => {

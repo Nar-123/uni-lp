@@ -90,6 +90,7 @@ import {
   priceCompleteFor,
   resolveReceivedAmount,
 } from './safety.js';
+import { EXECUTION_RECEIPT_TIMEOUT_MS } from './receiptWait.js';
 
 export type V4PoolKey = {
   currency0: Address;
@@ -470,7 +471,7 @@ export async function createV4PoolAndMintSingleSided(params: {
         chain: wallet.chain,
         gas: initGas,
       });
-      const receipt = await client.waitForTransactionReceipt({ hash });
+      const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
       if (receipt.status !== 'success') {
         throw new Error(`initializePool tx reverted: ${hash}`);
       }
@@ -999,7 +1000,7 @@ async function ensurePermit2Allowance(
       account: wallet.account!,
       chain: wallet.chain,
     });
-    await client.waitForTransactionReceipt({ hash });
+    await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   }
 
   // 2) Permit2 → PositionManager
@@ -1022,7 +1023,7 @@ async function ensurePermit2Allowance(
       account: wallet.account!,
       chain: wallet.chain,
     });
-    await client.waitForTransactionReceipt({ hash });
+    await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   }
 }
 
@@ -1521,7 +1522,7 @@ export async function mintV4SingleSided(params: V4MintParams): Promise<V4MintRes
     gas: mintGas,
   });
 
-  const receipt = await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   if (receipt.status !== 'success') {
     throw new Error(`v4 mint tx reverted: ${hash}`);
   }
@@ -2795,7 +2796,7 @@ export async function closeV4Position(
             chain: wallet.chain,
             gas: attGas,
           });
-          const receipt = await client.waitForTransactionReceipt({ hash: h });
+          const receipt = await client.waitForTransactionReceipt({ hash: h, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
           if (receipt.status !== 'success') {
             throw new Error(`tx reverted ${h}`);
           }
@@ -2876,7 +2877,7 @@ export async function closeV4Position(
           chain: wallet.chain,
           gas: burnGas,
         });
-        await client.waitForTransactionReceipt({ hash: bh });
+        await client.waitForTransactionReceipt({ hash: bh, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
       }
     } catch {
       /* NFT may remain empty — OK */
@@ -3030,7 +3031,7 @@ export async function claimV4Fees(
     chain: wallet.chain,
     gas: claimGas,
   });
-  const receipt = await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   if (receipt.status !== 'success') {
     throw new Error(`claim-v4-fees #${tokenId} tx reverted: ${hash}`);
   }

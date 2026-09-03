@@ -117,6 +117,18 @@ test('invalid tickSpacing (0, negative, or NaN — malformed pool state) fails c
   }
 });
 
+test('invalid currentTick (NaN/Infinity/-Infinity — malformed pool state) fails closed, never hangs, never a NaN tick reported as valid', () => {
+  for (const badTick of [NaN, Infinity, -Infinity]) {
+    const result = computeMultiRange({
+      currentTick: badTick,
+      tickSpacing: 60,
+      widthPercent: 50,
+      usdgIsToken0: true,
+    });
+    assert.equal(result.valid, false, `currentTick=${badTick} must fail closed`);
+  }
+});
+
 test('near max-tick boundary overflow fails closed rather than producing an out-of-range tick', () => {
   const result = computeMultiRange({
     currentTick: 887_270, // just below TickMath.MAX_TICK

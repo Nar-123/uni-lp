@@ -211,6 +211,29 @@ export async function resolveAmbiguousTx(
  * entries. Dependency-injected so it's testable without db/config, and
  * reusable both at bot boot and as a pre-send gate (clients.ts).
  */
+/**
+ * Phase 4.6.3: entries are recovered CONCURRENTLY, not one-at-a-time.
+ * Each entry's check (`resolveAmbiguousTx` — a bounded receipt poll or
+ * pending-nonce poll) is an independent, read-only RPC lookup keyed on
+ * that entry's own txHash/nonce: none of them share mutable state, none
+ * can submit a transaction, and none can affect another entry's
+ * classification. Running N of them sequentially costs O(sum of their
+ * latencies) — with a slow/flaky RPC this turned "check 5 unresolved
+ * transactions before sending" into a multi-minute stall even though the
+ * checks don't depend on each other. Concurrently, it costs
+ * O(max of their latencies) instead. This changes WHEN the reads happen,
+ * not WHAT they check or how outcomes are classified: `resolveAmbiguousTx`
+ * itself is completely unchanged, and every entry is still classified
+ * independently and explicitly — a slow/failing entry can never affect
+ * another entry's result, and never gets silently upgraded past its own
+ * true outcome.
+ *
+ * Each entry's recovery attempt catches its own error internally (exactly
+ * matching the prior sequential loop's per-entry try/catch) so `Promise.all`
+ * here can never reject — one entry throwing is isolated to that entry
+ * (logged, treated as "still unresolved"), never lost track of and never
+ * misattributed to a different entry.
+ */
 export async function recoverUnresolvedEntries<
   E extends RecoverableEntry & { id: number; chainId: number; action: string },
 >(
@@ -219,17 +242,20 @@ export async function recoverUnresolvedEntries<
   onResolved: (id: number, outcome: RecoveryOutcome) => void,
   resolveOpts?: Parameters<typeof resolveAmbiguousTx>[2],
 ): Promise<{ resolved: number; stillUnresolved: number }> {
-  let resolved = 0;
-  for (const entry of entries) {
-    try {
-      const client = getClientForChain(entry.chainId);
-      const outcome = await resolveAmbiguousTx(client, entry, resolveOpts);
-      onResolved(entry.id, outcome);
-      if (outcome !== 'SUBMITTED') resolved++;
-      console.log(`[tx-recovery] #${entry.id} (${entry.action}) -> ${outcome}`);
-    } catch (e) {
-      console.error(`[tx-recovery] #${entry.id} recovery attempt threw:`, e);
-    }
-  }
+  const results = await Promise.all(
+    entries.map(async (entry): Promise<boolean> => {
+      try {
+        const client = getClientForChain(entry.chainId);
+        const outcome = await resolveAmbiguousTx(client, entry, resolveOpts);
+        onResolved(entry.id, outcome);
+        console.log(`[tx-recovery] #${entry.id} (${entry.action}) -> ${outcome}`);
+        return outcome !== 'SUBMITTED';
+      } catch (e) {
+        console.error(`[tx-recovery] #${entry.id} recovery attempt threw:`, e);
+        return false;
+      }
+    }),
+  );
+  const resolved = results.filter(Boolean).length;
   return { resolved, stillUnresolved: entries.length - resolved };
 }

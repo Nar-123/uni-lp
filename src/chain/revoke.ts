@@ -18,6 +18,7 @@ import {
   getWalletClient,
 } from './clients.js';
 import { getTokenMeta } from './tokens.js';
+import { EXECUTION_RECEIPT_TIMEOUT_MS } from './receiptWait.js';
 
 /** Relay contracts commonly approved by bridge quotes (same on RH + BSC Cancun). */
 export const RELAY_SPENDERS = {
@@ -272,7 +273,7 @@ export async function revokeApproval(a: FoundApproval): Promise<RevokeResult> {
     });
   }
 
-  const receipt = await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   if (receipt.status === 'reverted') {
     throw new Error(`Revoke tx reverted: ${hash}`);
   }

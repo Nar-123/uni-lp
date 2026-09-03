@@ -102,7 +102,18 @@ export async function executeTradeIntent(params: {
   let balancePercent = 0;
 
   if (config.positionSizeUsd != null) {
-    const usdgPrice = (await getTokenPriceUsd(config.chainId, usdgAddress)) ?? 1;
+    // Phase 4.7 fix: a failed/unavailable USDG price lookup must abort the
+    // trade, not silently fabricate $1.00 — no capital has moved yet at
+    // this point, so failing closed here is free. Fabricating a price to
+    // size a real deposit ($positionSizeUsd / assumedPrice) risked
+    // depositing a materially wrong token amount whenever MULTI_USDG_ADDRESS
+    // is overridden to a non-default quote asset DexScreener fails to
+    // price (the built-in chain default short-circuits to a real
+    // stable-peg 1.0 and is not affected — see price/dexscreener.ts).
+    const usdgPrice = await getTokenPriceUsd(config.chainId, usdgAddress);
+    if (usdgPrice == null) {
+      return { skipped: true, reason: 'PRICE_UNAVAILABLE' };
+    }
     fixedAmountHuman = config.positionSizeUsd / usdgPrice;
   } else if (prefs.sizeMode === 'fixed') {
     fixedAmountHuman = prefs.fixedAmountHuman;
@@ -147,7 +158,18 @@ export async function executeTradeIntent(params: {
 
   const usdgMeta = await getTokenMeta(intent.chainId, usdgAddress);
   const depositAmountHuman = humanToFloat(result.depositAmount, usdgMeta.decimals);
-  const usdgPriceNow = (await getTokenPriceUsd(intent.chainId, usdgAddress)) ?? 1;
+  // The deposit has already been broadcast and confirmed by this point —
+  // unlike the pre-mint sizing lookup above, there is no safe way to abort
+  // here. A failed lookup still must not silently masquerade as a normal,
+  // confident $1.00 price: logged so a real quote-asset depeg or DexScreener
+  // outage during the accounting step is observable rather than invisible.
+  const usdgPriceRaw = await getTokenPriceUsd(intent.chainId, usdgAddress);
+  if (usdgPriceRaw == null) {
+    console.warn(
+      `[multi] price lookup failed while recording deposit accounting for ${usdgAddress} on chain ${intent.chainId} — falling back to $1.00; verify via /pnl if this quote asset is not actually pegged`,
+    );
+  }
+  const usdgPriceNow = usdgPriceRaw ?? 1;
   const depositUsd = depositAmountHuman * usdgPriceNow;
 
   setJournalAccountingMeta(intent.chainId, result.hash, [
@@ -158,6 +180,7 @@ export async function executeTradeIntent(params: {
       amountRaw: result.depositAmount.toString(),
       amountHuman: depositAmountHuman,
       usd: depositUsd,
+      strategy: 'multi',
     },
   ]);
 
@@ -263,12 +286,22 @@ export async function runMultiStrategy(
   const prefs = opts?.prefs ?? DEFAULT_PREFS;
 
   for (const candidate of candidates) {
-    const { selected } = await discoverAndScorePoolsForCandidate(config, candidate, {
+    const { selected, poolFetchError } = await discoverAndScorePoolsForCandidate(config, candidate, {
       poolFetcher: opts?.poolFetcher,
     });
 
     if (!selected) {
-      rejected.push(rejectCandidate(candidate, 'NO_VALID_POOL'));
+      if (poolFetchError) {
+        // Phase 4.7 fix: an infrastructure failure while fetching pools must
+        // not be recorded as "this candidate has no valid pool" — that reason
+        // code is meant for a genuine data-quality verdict, not an outage.
+        console.warn(
+          `[multi] pool discovery failed for ${candidate.address} on chain ${config.chainId}: ${poolFetchError.message}`,
+        );
+        rejected.push(rejectCandidate(candidate, 'POOL_FETCH_ERROR'));
+      } else {
+        rejected.push(rejectCandidate(candidate, 'NO_VALID_POOL'));
+      }
       continue;
     }
 

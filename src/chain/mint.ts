@@ -41,6 +41,7 @@ import {
   type MintPreviewResult,
 } from './prices.js';
 import { getTokenPriceUsd, formatUsd } from '../price/dexscreener.js';
+import { EXECUTION_RECEIPT_TIMEOUT_MS } from './receiptWait.js';
 
 export type { MintPreviewResult };
 
@@ -102,7 +103,7 @@ async function ensureAllowance(
     account: wallet.account!,
     chain: wallet.chain,
   });
-  await client.waitForTransactionReceipt({ hash });
+  await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
 }
 
 export type MintParamsWithProtocol = MintParams & {
@@ -476,7 +477,7 @@ export async function mintSingleSided(params: MintParamsWithProtocol): Promise<M
     gas,
   });
 
-  const receipt = await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   if (receipt.status !== 'success') {
     throw new Error(`Mint tx reverted on-chain: ${hash}`);
   }

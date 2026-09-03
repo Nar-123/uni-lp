@@ -2,6 +2,7 @@ import type { Address, Hash } from 'viem';
 import { CHAINS, type SupportedChainId } from '../config.js';
 import { getHotWalletAddress, getPublicClient, getWalletClient } from './clients.js';
 import { formatUnits, getTokenBalance } from './tokens.js';
+import { EXECUTION_RECEIPT_TIMEOUT_MS } from './receiptWait.js';
 
 /** WETH9 / WBNB: deposit() payable wraps native; withdraw(uint) unwraps */
 export const weth9Abi = [
@@ -117,7 +118,7 @@ export async function wrapNative(
     chain: wallet.chain,
   });
 
-  const receipt = await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   if (receipt.status !== 'success') {
     throw new Error(`Wrap tx failed: ${hash}`);
   }
@@ -160,7 +161,7 @@ export async function unwrapNative(
     chain: wallet.chain,
   });
 
-  const receipt = await client.waitForTransactionReceipt({ hash });
+  const receipt = await client.waitForTransactionReceipt({ hash, timeout: EXECUTION_RECEIPT_TIMEOUT_MS });
   if (receipt.status !== 'success') {
     throw new Error(`Unwrap tx failed: ${hash}`);
   }
