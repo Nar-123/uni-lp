@@ -12,6 +12,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -22,6 +24,22 @@ const pExecFile = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TSX_CLI = path.join(HERE, '..', 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const FIXTURE = path.join(HERE, 'fixtures', 'assert-trading-mode.mts');
+
+/**
+ * The fixture imports src/config.ts, whose top-level `import 'dotenv/config'`
+ * loads a `.env` file from the CHILD PROCESS's cwd for any key not already
+ * present in its env — independently of what this test explicitly deletes
+ * from the `env` object it passes to execFile. On a deployment whose real
+ * `.env` sets TRADING_MODE (e.g. a staging VPS), running this fixture from
+ * the repo root would let dotenv silently reintroduce TRADING_MODE=staging
+ * into the "missing" case, even though the test never intended that value
+ * to be present. Running the child from an empty scratch directory (no
+ * .env at all) makes dotenv's load a no-op, so "missing" genuinely means
+ * missing — without touching src/config.ts, without touching the real
+ * .env, and without changing what the other two fixture cases (which
+ * explicitly set TRADING_MODE themselves before dotenv ever runs) observe.
+ */
+const FIXTURE_CWD = fs.mkdtempSync(path.join(os.tmpdir(), 'unicrit-trading-mode-fixture-cwd-'));
 
 function withTradingModeEnv<T>(value: string | undefined, fn: () => T): T {
   const prior = process.env.TRADING_MODE;
@@ -118,7 +136,7 @@ function runTradingModeFixture(value: string | undefined): Promise<{ code: numbe
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (value == null) delete env.TRADING_MODE;
   else env.TRADING_MODE = value;
-  return pExecFile(process.execPath, [TSX_CLI, FIXTURE], { env, timeout: 20_000 })
+  return pExecFile(process.execPath, [TSX_CLI, FIXTURE], { env, cwd: FIXTURE_CWD, timeout: 20_000 })
     .then((r) => ({ code: 0, stdout: r.stdout, stderr: r.stderr }))
     .catch((e: NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: number }) => ({
       code: typeof e.code === 'number' ? e.code : 1,
