@@ -28,6 +28,7 @@
  *    a green light. Reporting NOT_EXPOSED is the honest answer.
  */
 import { createServer, type Server } from 'node:http';
+import { getTradingMode } from './config.js';
 
 export type AppLifecycleState = 'starting' | 'ready' | 'failed' | 'stopping' | 'stopped';
 
@@ -62,13 +63,14 @@ export function buildLivenessResponse(): HealthResponse {
     body: {
       status: 'ok',
       state: lifecycleState,
+      mode: getTradingMode(),
       uptimeSeconds: Math.round(process.uptime()),
       timestamp: new Date().toISOString(),
     },
   };
 }
 
-/** Pure, directly-testable — reads only the local lifecycle variables above. */
+/** Pure, directly-testable — reads only the local lifecycle variables above (plus the non-sensitive TRADING_MODE string; never a secret, never an RPC URL/token/key). */
 export function buildReadinessResponse(): HealthResponse {
   const ready = lifecycleState === 'ready';
   return {
@@ -76,6 +78,7 @@ export function buildReadinessResponse(): HealthResponse {
     body: {
       status: ready ? 'ok' : 'not_ready',
       state: lifecycleState,
+      mode: getTradingMode(),
       readySince: readySince != null ? new Date(readySince).toISOString() : null,
       tradingSafe: 'NOT_EXPOSED',
       ...(readinessNotes.length > 0 ? { warnings: readinessNotes } : {}),

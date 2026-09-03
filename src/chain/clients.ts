@@ -12,7 +12,7 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { base, bsc } from 'viem/chains';
-import { config, type SupportedChainId, CHAINS, isSupportedChainId } from '../config.js';
+import { config, getTradingMode, type SupportedChainId, CHAINS, isSupportedChainId } from '../config.js';
 import {
   getActiveWallet,
   getWalletById,
@@ -98,6 +98,43 @@ function deriveActionLabel(kind: 'sendTransaction' | 'writeContract', firstArg: 
 }
 
 /**
+ * Phase 4.7.1 — global staging/dry-run gate.
+ *
+ * Thrown by journalledSend, and ONLY by journalledSend, when
+ * TRADING_MODE=staging refuses a real broadcast. Deliberately NOT a
+ * RecoveryOutcome / journal state: a staging block never reaches the
+ * journal at all (see journalledSend below) — there is nothing to recover,
+ * nothing pending, nothing ambiguous. A dedicated class (rather than a
+ * plain Error or a reused txRecovery.ts marker) lets any caller
+ * distinguish STAGING_BLOCKED from SUCCESS, FAILED, and UNKNOWN with a
+ * simple `instanceof`/duck-type check, so a caller cannot mistake a
+ * deliberate non-broadcast for a real blockchain failure worth retrying
+ * or recording.
+ */
+export class StagingBlockedError extends Error {
+  readonly staged: true = true;
+  readonly kind: 'sendTransaction' | 'writeContract';
+  readonly chainId: SupportedChainId;
+  readonly walletAddress: Address;
+
+  constructor(kind: 'sendTransaction' | 'writeContract', chainId: SupportedChainId, walletAddress: Address) {
+    super(
+      `[staging] ${kind} refused on chain ${chainId} for ${walletAddress} — ` +
+        `TRADING_MODE=staging: no transaction was broadcast, no journal entry was created.`,
+    );
+    this.name = 'StagingBlockedError';
+    this.kind = kind;
+    this.chainId = chainId;
+    this.walletAddress = walletAddress;
+  }
+}
+
+/** Duck-typed check (mirrors txRecovery.ts's isNoRetryTxError pattern) — safe across module/realm boundaries, no import cycle required. */
+export function isStagingBlockedError(e: unknown): e is StagingBlockedError {
+  return !!(e && typeof e === 'object' && (e as Record<string, unknown>).staged === true && (e as Error).name === 'StagingBlockedError');
+}
+
+/**
  * Transaction recovery wrapper (Phase 2 Part 4) — wired around the same
  * choke point txLock already uses, so every local send/write (mint, close,
  * swap, TP/SL, bridging, revoke, transfer, wrap/unwrap) is covered with no
@@ -127,6 +164,23 @@ async function journalledSend<Args extends unknown[]>(
   raw: (...args: Args) => Promise<Hex>,
   args: Args,
 ): Promise<Hex> {
+  // Phase 4.7.1: the global staging gate. Checked FIRST, before any journal
+  // read/write and before any RPC call — a staging block must never touch
+  // the real, authoritative journal (createTxJournalEntry is not called at
+  // all on this path), so it can never masquerade as an unresolved
+  // transaction on a later real send, and never requires (or performs) any
+  // recovery. This is the one and only place in the whole codebase where a
+  // real broadcast (sendTransaction/writeContract, from mint/close/swap/
+  // TP-SL/bridging/revoke/transfer/GMGN) can occur — every call reaches
+  // this exact function via getWalletClient's wrapping below, so a mistake
+  // in any individual caller cannot bypass this check.
+  if (getTradingMode() === 'staging') {
+    console.warn(
+      `[staging] blocked ${kind} for ${walletAddress} on chain ${chainId} — TRADING_MODE=staging active, refusing to broadcast`,
+    );
+    throw new StagingBlockedError(kind, chainId, walletAddress);
+  }
+
   const publicClient = getPublicClient(chainId);
   const recoveryClient = publicClient as unknown as MinimalReceiptClient & MinimalNonceClient;
 

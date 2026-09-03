@@ -260,3 +260,60 @@ test('an invalid bind (port already in use) is reported, not thrown, and never c
 test('stopHealthServer on a never-started server is a safe no-op', async () => {
   await assert.doesNotReject(() => stopHealthServer());
 });
+
+// ── Phase 4.7.1: TRADING_MODE exposed via health/readiness (task item #12) ──
+
+function withTradingMode<T>(value: string | undefined, fn: () => T): T {
+  const prior = process.env.TRADING_MODE;
+  if (value == null) delete process.env.TRADING_MODE;
+  else process.env.TRADING_MODE = value;
+  try {
+    return fn();
+  } finally {
+    if (prior == null) delete process.env.TRADING_MODE;
+    else process.env.TRADING_MODE = prior;
+  }
+}
+
+test('readiness reports mode=live by default (TRADING_MODE unset)', () => {
+  reset();
+  withTradingMode(undefined, () => {
+    assert.equal(buildReadinessResponse().body.mode, 'live');
+    assert.equal(buildLivenessResponse().body.mode, 'live');
+  });
+});
+
+test('readiness and liveness report mode=staging when TRADING_MODE=staging', () => {
+  reset();
+  withTradingMode('staging', () => {
+    assert.equal(buildReadinessResponse().body.mode, 'staging');
+    assert.equal(buildLivenessResponse().body.mode, 'staging');
+  });
+});
+
+test('mode is reported alongside — never instead of — tradingSafe=NOT_EXPOSED, and never exposes a secret', () => {
+  reset();
+  withTradingMode('staging', () => {
+    const body = buildReadinessResponse().body;
+    assert.equal(body.mode, 'staging');
+    assert.equal(body.tradingSafe, 'NOT_EXPOSED', 'exposing the mode must not turn into inventing a safe-to-trade boolean');
+    const serialized = JSON.stringify(body);
+    assert.doesNotMatch(serialized, /0x[0-9a-fA-F]{64}/, 'no private-key-shaped value');
+    assert.doesNotMatch(serialized, /\d{6,}:[A-Za-z0-9_-]{30,}/, 'no Telegram-bot-token-shaped value');
+    assert.doesNotMatch(serialized, /https?:\/\//, 'no RPC URL of any kind, credentialed or not');
+  });
+});
+
+test('mode reflects a live change in TRADING_MODE without needing a server restart (reads process.env fresh, like getActiveStrategyName)', () => {
+  reset();
+  const prior = process.env.TRADING_MODE;
+  try {
+    delete process.env.TRADING_MODE;
+    assert.equal(buildReadinessResponse().body.mode, 'live');
+    process.env.TRADING_MODE = 'staging';
+    assert.equal(buildReadinessResponse().body.mode, 'staging');
+  } finally {
+    if (prior == null) delete process.env.TRADING_MODE;
+    else process.env.TRADING_MODE = prior;
+  }
+});

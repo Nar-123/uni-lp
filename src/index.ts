@@ -1,4 +1,4 @@
-import { config } from './config.js';
+import { assertValidTradingModeEnv, config, getTradingMode } from './config.js';
 import { getDb } from './db/index.js';
 import { getHotWalletAddress, runStartupTxRecovery } from './chain/clients.js';
 import { listWallets, getActiveWallet } from './wallet/keys.js';
@@ -42,6 +42,16 @@ async function main() {
   // exits non-zero — the same fail-closed path Phase 4.6.6 established for
   // invalid RPC/address configuration.
   assertValidStrategyEnv();
+
+  // Phase 4.7.1: TRADING_MODE validated the same way and at the same point
+  // as STRATEGY above — a present-but-unrecognized value fails startup
+  // outright rather than being silently absorbed into 'live'. Unlike
+  // STRATEGY, an invalid TRADING_MODE is arguably even more safety-critical
+  // to catch here: a typo that should have meant "staging" must never
+  // silently run as 'live' (the default). Logged unconditionally so the
+  // active mode is always visible in startup logs, not just when staging.
+  assertValidTradingModeEnv();
+  console.log(`[startup] TRADING_MODE=${getTradingMode()}${getTradingMode() === 'staging' ? ' — all transaction broadcasts will be refused at the journalledSend choke point' : ''}`);
 
   // Phase 4.6.1 (P1-2): claim exclusive ownership of this wallet/dbPath
   // BEFORE any transaction-capable service (db load, wallet client, bot,

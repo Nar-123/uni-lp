@@ -80,6 +80,62 @@ function parseUserIds(raw: string | undefined): Set<number> {
   return new Set(ids);
 }
 
+/**
+ * Phase 4.7.1 — global non-trading staging/dry-run gate.
+ *
+ * 'live' (default, existing behavior unchanged) — every write path behaves
+ * exactly as before this phase; nothing here alters production behavior
+ * when TRADING_MODE is unset or explicitly 'live'.
+ *
+ * 'staging' — the ENTIRE application (main(), instance lock, startup
+ * recovery, health, Telegram, TP/SL watcher, MULTI's read-only discovery)
+ * may run normally, but the single, centralized broadcast choke point
+ * (chain/clients.ts's journalledSend — the sole place `createWalletClient`
+ * is ever constructed, wrapping every sendTransaction/writeContract call in
+ * this codebase) refuses to call the real RPC send and throws a dedicated,
+ * typed StagingBlockedError instead. See chain/clients.ts for the
+ * enforcement; this file only parses/validates the mode name, exactly
+ * mirroring strategy/multiConfig.ts's STRATEGY pattern (assertValidEnv at
+ * startup, a separate never-throwing live getter for hot-path reads).
+ */
+export type TradingMode = 'live' | 'staging';
+
+const VALID_TRADING_MODES: readonly TradingMode[] = ['live', 'staging'];
+
+/**
+ * Live, uncached read — called on every send inside journalledSend (a hot
+ * path), so this stays a cheap string compare with no I/O, mirroring
+ * strategy/multiConfig.ts's getActiveStrategyName(). MISSING (unset) is
+ * intentionally NOT an error — it is the existing, documented default
+ * ('live'), so a deployment that predates this phase (or simply never sets
+ * TRADING_MODE) sees byte-for-byte the same behavior as before this phase.
+ */
+export function getTradingMode(): TradingMode {
+  const raw = (process.env.TRADING_MODE ?? 'live').trim().toLowerCase();
+  return raw === 'staging' ? 'staging' : 'live';
+}
+
+/**
+ * Authoritative startup-time TRADING_MODE validation — a present-but-
+ * unrecognized value (typo, garbage) is rejected outright rather than
+ * silently absorbed into 'live', exactly like assertValidStrategyEnv's
+ * treatment of STRATEGY. Call once, early at process startup, before any
+ * transaction-capable service starts; a thrown error here is expected to
+ * propagate to the top-level startup failure handler. Deliberately
+ * separate from getTradingMode() above, which stays unchanged and must
+ * keep never throwing — it is read on every send, not just once at
+ * startup.
+ */
+export function assertValidTradingModeEnv(): void {
+  const raw = process.env.TRADING_MODE;
+  if (raw == null) return; // unset — existing 'live' default applies, not an error
+  const normalized = raw.trim().toLowerCase();
+  if ((VALID_TRADING_MODES as readonly string[]).includes(normalized)) return;
+  throw new Error(
+    `Invalid TRADING_MODE "${raw}": expected one of ${VALID_TRADING_MODES.join(', ')} (or unset, which defaults to 'live')`,
+  );
+}
+
 export const SUPPORTED_CHAIN_IDS = [4663, 56, 8453] as const;
 export type SupportedChainId = (typeof SUPPORTED_CHAIN_IDS)[number];
 
