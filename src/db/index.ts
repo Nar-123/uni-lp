@@ -1611,6 +1611,145 @@ export function getMultiPositionMeta(
   );
 }
 
+export type TokenIdRepairResult =
+  | { status: 'REPAIRED'; oldTokenId: string; newTokenId: string }
+  | { status: 'ALREADY_CORRECT' }
+  | { status: 'NO_LEDGER_ENTRY_FOR_TX_HASH' }
+  | { status: 'TARGET_TOKEN_ID_ALREADY_EXISTS' }
+  | { status: 'INCONSISTENT_EXISTING_TOKEN_ID' }
+  | { status: 'MISMATCH'; field: string; expected: unknown; stored: unknown };
+
+/**
+ * Phase 4.7.2 — narrow, idempotent repair for a specific, previously-seen
+ * bug: src/chain/v4.ts's mint path used to derive the newly-minted tokenId
+ * from a pre-broadcast read of the position manager's SHARED, global
+ * `nextTokenId()` counter, which drifts wrong whenever any other user's
+ * mint lands on the same public contract in between (fixed in this same
+ * phase — see extractMintedTokenId in chain/v4.ts). This function repairs
+ * the resulting stale records for a transaction that already happened
+ * under the old, buggy code — it never broadcasts anything, never touches
+ * the blockchain, and only ever corrects the `token_id`/`tokenId` field
+ * itself, anchored strictly by the transaction hash (the one identifier
+ * that cannot have drifted, since it was returned directly by the real
+ * broadcast call).
+ *
+ * Every other field (deposit amount, pool, range, fee, timestamp, strategy
+ * tag, candidate metadata) is left completely untouched — this function
+ * only ever writes to the `token_id`/`tokenId` fields it explicitly
+ * documents above, on rows it has already located and cross-validated.
+ *
+ * Safety properties, all deliberately testable in isolation:
+ *  - Idempotent: a second call after a successful repair finds the ledger
+ *    row's token_id already equal to `correctTokenId` and returns
+ *    ALREADY_CORRECT without writing anything.
+ *  - Anchored by tx_hash, not by scanning/guessing which row is "probably"
+ *    wrong — a hash with no matching ledger row fails closed
+ *    (NO_LEDGER_ENTRY_FOR_TX_HASH) rather than repairing the wrong record.
+ *  - Refuses (fails closed, writes nothing) if the caller's `expected`
+ *    pool/token/fee/range values do not match what is actually stored for
+ *    that transaction — this is the caller's (chain/v4.ts's own
+ *    independently-verified, real on-chain read's) cross-check that it is
+ *    repairing the record it thinks it is.
+ *  - Refuses if the target tokenId already exists as a *different* row
+ *    (would-be duplicate) in positions or multi_position_meta.
+ *  - Refuses if the ledger rows for this tx_hash do not already agree
+ *    among themselves on the (wrong) old tokenId — an inconsistency this
+ *    function is not the right tool to resolve.
+ *  - Never creates a new row, never deletes a row, never touches amounts.
+ */
+export function repairPositionTokenIdByTxHash(params: {
+  chainId: number;
+  txHash: string;
+  correctTokenId: string;
+  expected?: {
+    poolAddress?: string;
+    token0?: string;
+    token1?: string;
+    fee?: number;
+    tickLower?: number;
+    tickUpper?: number;
+  };
+}): TokenIdRepairResult {
+  const s = load();
+  const hash = params.txHash.toLowerCase();
+  const expected = params.expected ?? {};
+
+  const ledgerRows = s.ledger.filter(
+    (r) => r.tx_hash?.toLowerCase() === hash && r.chain_id === params.chainId,
+  );
+  if (ledgerRows.length === 0) {
+    return { status: 'NO_LEDGER_ENTRY_FOR_TX_HASH' };
+  }
+
+  const oldTokenId = ledgerRows[0]!.token_id;
+  if (!ledgerRows.every((r) => r.token_id === oldTokenId)) {
+    return { status: 'INCONSISTENT_EXISTING_TOKEN_ID' };
+  }
+  if (oldTokenId === params.correctTokenId) {
+    return { status: 'ALREADY_CORRECT' };
+  }
+
+  const posRow = s.positions.find(
+    (p) => p.chain_id === params.chainId && p.token_id === oldTokenId,
+  );
+  if (posRow) {
+    if (expected.poolAddress != null && posRow.pool_address?.toLowerCase() !== expected.poolAddress.toLowerCase()) {
+      return { status: 'MISMATCH', field: 'poolAddress', expected: expected.poolAddress, stored: posRow.pool_address };
+    }
+    if (expected.token0 != null && posRow.token0.toLowerCase() !== expected.token0.toLowerCase()) {
+      return { status: 'MISMATCH', field: 'token0', expected: expected.token0, stored: posRow.token0 };
+    }
+    if (expected.token1 != null && posRow.token1.toLowerCase() !== expected.token1.toLowerCase()) {
+      return { status: 'MISMATCH', field: 'token1', expected: expected.token1, stored: posRow.token1 };
+    }
+    if (expected.fee != null && posRow.fee !== expected.fee) {
+      return { status: 'MISMATCH', field: 'fee', expected: expected.fee, stored: posRow.fee };
+    }
+    if (expected.tickLower != null && posRow.tick_lower !== expected.tickLower) {
+      return { status: 'MISMATCH', field: 'tickLower', expected: expected.tickLower, stored: posRow.tick_lower };
+    }
+    if (expected.tickUpper != null && posRow.tick_upper !== expected.tickUpper) {
+      return { status: 'MISMATCH', field: 'tickUpper', expected: expected.tickUpper, stored: posRow.tick_upper };
+    }
+  }
+
+  const targetPosExists = s.positions.some(
+    (p) => p.chain_id === params.chainId && p.token_id === params.correctTokenId,
+  );
+  if (targetPosExists) {
+    return { status: 'TARGET_TOKEN_ID_ALREADY_EXISTS' };
+  }
+  const targetMetaExists = (s.multi_position_meta ?? []).some(
+    (m) => m.chainId === params.chainId && m.tokenId === params.correctTokenId,
+  );
+  if (targetMetaExists) {
+    return { status: 'TARGET_TOKEN_ID_ALREADY_EXISTS' };
+  }
+
+  // All checks passed — apply the correction, token_id/tokenId fields only.
+  for (const row of ledgerRows) {
+    row.token_id = params.correctTokenId;
+  }
+  if (posRow) {
+    posRow.token_id = params.correctTokenId;
+  }
+  const metaRow = (s.multi_position_meta ?? []).find(
+    (m) => m.chainId === params.chainId && m.tokenId === oldTokenId,
+  );
+  if (metaRow) {
+    metaRow.tokenId = params.correctTokenId;
+  }
+  for (const j of s.tx_journal ?? []) {
+    if (j.tx_hash?.toLowerCase() === hash && j.accounting_meta) {
+      for (const meta of j.accounting_meta) {
+        if (meta.tokenId === oldTokenId) meta.tokenId = params.correctTokenId;
+      }
+    }
+  }
+  persist();
+  return { status: 'REPAIRED', oldTokenId, newTokenId: params.correctTokenId };
+}
+
 /** Open positions, optionally filtered to one chain — used by MULTI risk gates. */
 export function listOpenPositions(chainId?: number): TrackedPosition[] {
   const s = load();

@@ -1248,6 +1248,88 @@ function currencyIsDeposit(currency: Address, deposit: Address, wrapped: Address
   return false;
 }
 
+/**
+ * Post-canary reconciliation (Phase 4.7): thrown by extractMintedTokenId
+ * when the actually-minted tokenId cannot be determined from the mint
+ * transaction's own receipt. Deliberately distinct from a generic Error so
+ * callers (and tests) can recognize this specific failure mode and never
+ * mistake it for a reverted/failed mint — the transaction already
+ * succeeded on-chain by the time this can be thrown; only the tokenId is
+ * unknown. The transaction hash remains recoverable via the tx journal
+ * (journalledSend records it before this function is ever reached), so
+ * failing closed here costs nothing but an extra manual lookup — it never
+ * loses the ability to find the real position later.
+ */
+export class MintTokenIdExtractionError extends Error {
+  constructor(context: string) {
+    super(
+      `Could not determine the minted tokenId from this mint transaction's own receipt (${context}). ` +
+        `Refusing to guess or fall back to a pre-read counter value — the transaction hash is already ` +
+        `recorded in the tx journal and can be used to recover the real tokenId manually.`,
+    );
+    this.name = 'MintTokenIdExtractionError';
+  }
+}
+
+const ERC721_ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+/**
+ * Extracts the tokenId actually minted to `recipient` by `positionManager`
+ * in THIS SPECIFIC transaction receipt, by decoding its own ERC-721
+ * Transfer event (from the zero address — a mint — to `recipient`).
+ *
+ * Deliberately never derives a tokenId from `nextTokenId()`/any other
+ * pre-broadcast counter read: that counter is shared/global across every
+ * caller of the position manager, so another user's mint landing between
+ * the counter read and this transaction's own confirmation makes any such
+ * guess wrong. This is not theoretical — a real $50 canary mint
+ * (0xce5ffd45497a23ef4a52ae7bf5651fd8e619049f3209175f2b10c90ce66e80f7) was
+ * recorded under tokenId 1731172 (a pre-existing NFT owned by an unrelated
+ * wallet) instead of the actually-minted 1731176, because four other
+ * mints landed on the same shared PositionManager in between.
+ *
+ * Fails closed (throws MintTokenIdExtractionError) rather than fabricating
+ * a value when zero or more than one matching mint-Transfer-to-recipient
+ * event is found in this receipt's logs.
+ */
+export function extractMintedTokenId(
+  receipt: { logs: readonly { address: string; data: Hex; topics: Hex[] }[] },
+  positionManager: Address,
+  recipient: Address,
+): bigint {
+  const posmLower = positionManager.toLowerCase();
+  const recipientLower = recipient.toLowerCase();
+  const matches: bigint[] = [];
+  for (const log of receipt.logs) {
+    if (log.address.toLowerCase() !== posmLower) continue;
+    let decoded: { eventName: string; args: unknown };
+    try {
+      decoded = decodeEventLog({
+        abi: v4PositionManagerAbi,
+        data: log.data,
+        topics: log.topics as [Hex, ...Hex[]],
+      }) as { eventName: string; args: unknown };
+    } catch {
+      continue; // not a Transfer (or any decodable event in this ABI) — skip, never guess
+    }
+    if (decoded.eventName !== 'Transfer') continue;
+    const args = decoded.args as { from?: Address; to?: Address; tokenId?: bigint };
+    if (typeof args.from !== 'string' || args.from.toLowerCase() !== ERC721_ZERO_ADDRESS) continue; // not a mint (a real transfer, not from=0x0)
+    if (typeof args.to !== 'string' || args.to.toLowerCase() !== recipientLower) continue; // not to us
+    if (typeof args.tokenId !== 'bigint') continue; // malformed decode — never guess
+    matches.push(args.tokenId);
+  }
+  if (matches.length === 0) {
+    throw new MintTokenIdExtractionError('no matching mint Transfer event (from=0x0, to=recipient) found in the receipt logs');
+  }
+  if (matches.length > 1) {
+    throw new MintTokenIdExtractionError(
+      `${matches.length} ambiguous mint Transfer events found (tokenIds: ${matches.join(', ')}) — refusing to arbitrarily pick one`,
+    );
+  }
+  return matches[0]!;
+}
+
 export async function mintV4SingleSided(params: V4MintParams): Promise<V4MintResult> {
   const {
     chainId,
@@ -1493,12 +1575,6 @@ export async function mintV4SingleSided(params: V4MintParams): Promise<V4MintRes
     );
   }
 
-  const nextIdBefore = await client.readContract({
-    address: posm,
-    abi: v4PositionManagerAbi,
-    functionName: 'nextTokenId',
-  });
-
   const mintGas = await estimateWriteGas({
     client,
     address: posm,
@@ -1527,40 +1603,16 @@ export async function mintV4SingleSided(params: V4MintParams): Promise<V4MintRes
     throw new Error(`v4 mint tx reverted: ${hash}`);
   }
 
-  // tokenId = nextTokenId was assigned then incremented → minted id is nextIdBefore
-  let tokenId = nextIdBefore;
-  try {
-    const owner = await client.readContract({
-      address: posm,
-      abi: v4PositionManagerAbi,
-      functionName: 'ownerOf',
-      args: [tokenId],
-    });
-    if (owner.toLowerCase() !== recipient.toLowerCase()) {
-      // fallback: nextIdBefore - something; try nextIdBefore if still owned
-      tokenId = nextIdBefore;
-    }
-  } catch {
-    // try Transfer logs
-    for (const log of receipt.logs) {
-      if (log.address.toLowerCase() !== posm.toLowerCase()) continue;
-      try {
-        const decoded = decodeEventLog({
-          abi: v4PositionManagerAbi,
-          data: log.data,
-          topics: log.topics,
-        });
-        if (decoded.eventName === 'Transfer') {
-          const args = decoded.args as { to: Address; tokenId: bigint };
-          if (args.to?.toLowerCase() === recipient.toLowerCase()) {
-            tokenId = args.tokenId;
-          }
-        }
-      } catch {
-        /* skip */
-      }
-    }
-  }
+  // Phase 4.7 fix: the tokenId is derived exclusively from this transaction's
+  // own receipt (its ERC-721 Transfer event) — never from a pre-broadcast
+  // read of the position manager's shared `nextTokenId()` counter, which
+  // can and did drift when other users' mints landed in between. See
+  // extractMintedTokenId's own doc comment for the real incident this
+  // fixes. A failure here throws (fail closed) rather than fabricating a
+  // tokenId — the transaction hash is already durably recorded in the tx
+  // journal by journalledSend, so the real position can still be found
+  // and recovered manually even if this throws.
+  const tokenId = extractMintedTokenId(receipt, posm, recipient);
 
   // Resolve display token addresses (map native → wrapped for ledger)
   const token0Addr =
@@ -1608,6 +1660,34 @@ export async function mintV4SingleSided(params: V4MintParams): Promise<V4MintRes
     }
   } catch (e) {
     console.warn(`[v4 mint] #${tokenId} could not re-derive actual deposited amounts, using offered ceiling:`, e);
+  }
+
+  // Phase 4.7 defense-in-depth: actualAmount{0,1} is re-derived from this
+  // position's own on-chain liquidity (now correctly keyed by the real
+  // tokenId — see extractMintedTokenId above). It should never plausibly
+  // exceed the ceiling this mint call itself offered (amount{0,1}Desired) —
+  // a real single-sided mint cannot pull in more than what was offered. If
+  // it does, something upstream (wrong tokenId, wrong pool state, a stale
+  // read) has produced a number that does not describe this deposit, and
+  // recording it as "actual" would be worse than not recording it at all.
+  // This is observability-only: it never blocks the already-successful
+  // mint, never changes accounting, and never touches the ledger, which
+  // is sized from `depositAmount`/`resolveDepositAmount`, not from this
+  // telemetry figure.
+  const PLAUSIBILITY_MULTIPLE = 10n;
+  if (amount0Desired > 0n && actualAmount0 > amount0Desired * PLAUSIBILITY_MULTIPLE) {
+    console.warn(
+      `[v4 mint] #${tokenId} telemetry sanity check failed for token0: actualAmount0=${actualAmount0} ` +
+        `is implausibly larger than the offered ceiling amount0Desired=${amount0Desired} — discarding, using ceiling instead`,
+    );
+    actualAmount0 = amount0Desired;
+  }
+  if (amount1Desired > 0n && actualAmount1 > amount1Desired * PLAUSIBILITY_MULTIPLE) {
+    console.warn(
+      `[v4 mint] #${tokenId} telemetry sanity check failed for token1: actualAmount1=${actualAmount1} ` +
+        `is implausibly larger than the offered ceiling amount1Desired=${amount1Desired} — discarding, using ceiling instead`,
+    );
+    actualAmount1 = amount1Desired;
   }
 
   // Gas telemetry (Phase 3 §17) — v4 mint previously had none at all.
