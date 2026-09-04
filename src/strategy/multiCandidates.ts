@@ -78,6 +78,55 @@ function rejectWith(candidate: MultiCandidate, reason: string): RejectedCandidat
   return { ...candidate, rejectedReason: reason };
 }
 
+type FilterOutcome =
+  | { eligible: true; candidate: MultiCandidate }
+  | { eligible: false; reason: string; candidate: MultiCandidate };
+
+/**
+ * Phase 4.7 audit (F-10) — the exact base-filter decision logic used by
+ * fetchAndFilterCandidates's batch loop, extracted so revalidateCandidate
+ * (single-candidate, Execute-time) can reuse the IDENTICAL rules rather than
+ * duplicating them. Any future change to volume/market-cap/classification
+ * thresholds only ever needs to happen here.
+ */
+function evaluateBaseFilters(candidate: MultiCandidate, config: MultiConfig): FilterOutcome {
+  if (candidate.volume6hUsd == null) {
+    return { eligible: false, reason: 'VOLUME_UNKNOWN', candidate };
+  }
+  if (candidate.volume6hUsd <= 0) {
+    return { eligible: false, reason: 'VOLUME_NON_POSITIVE', candidate };
+  }
+  if (candidate.volume6hUsd < config.minCandidateVolumeUsd) {
+    return { eligible: false, reason: 'VOLUME_TOO_LOW', candidate };
+  }
+  if (candidate.marketCapUsd == null) {
+    return { eligible: false, reason: 'MC_UNKNOWN', candidate };
+  }
+  if (candidate.marketCapUsd < config.minMarketCapUsd) {
+    return { eligible: false, reason: 'MC_TOO_LOW', candidate };
+  }
+  if (candidate.classification === 'UNKNOWN') {
+    return { eligible: false, reason: 'CLASSIFICATION_UNKNOWN', candidate };
+  }
+  return { eligible: true, candidate };
+}
+
+/** Same split as evaluateBaseFilters, for the age check (which needs a secondary GMGN lookup). */
+function evaluateAgeFilter(
+  candidate: MultiCandidate,
+  ageHours: number | null,
+  config: MultiConfig,
+): FilterOutcome {
+  const withAge: MultiCandidate = { ...candidate, ageHours };
+  if (ageHours == null) {
+    return { eligible: false, reason: 'AGE_UNKNOWN', candidate: withAge };
+  }
+  if (ageHours < config.minTokenAgeHours) {
+    return { eligible: false, reason: 'AGE_TOO_LOW', candidate: withAge };
+  }
+  return { eligible: true, candidate: withAge };
+}
+
 function compareCandidates(a: MultiCandidate, b: MultiCandidate): number {
   const va = a.volume6hUsd ?? 0;
   const vb = b.volume6hUsd ?? 0;
@@ -140,38 +189,12 @@ export async function fetchAndFilterCandidates(
   for (const t of raw) {
     if (!t || typeof t.address !== 'string' || t.address.trim() === '') continue;
     const candidate = makeBaseCandidate(t, config.chainId, now);
-
-    if (candidate.volume6hUsd == null) {
-      rejected.push(rejectWith(candidate, 'VOLUME_UNKNOWN'));
+    const outcome = evaluateBaseFilters(candidate, config);
+    if (!outcome.eligible) {
+      rejected.push(rejectWith(outcome.candidate, outcome.reason));
       continue;
     }
-    // Phase 4.7 audit (F-07): numberOrNull only screens out non-finite values
-    // (NaN/Infinity) — zero and negative volume are both finite and used to
-    // pass silently. A "trending" candidate reporting zero or negative 6h
-    // volume is not a risk-tolerance judgment call, it is impossible/corrupt
-    // data (never coerced to a valid-but-low number), so this check is
-    // always on regardless of config.minCandidateVolumeUsd.
-    if (candidate.volume6hUsd <= 0) {
-      rejected.push(rejectWith(candidate, 'VOLUME_NON_POSITIVE'));
-      continue;
-    }
-    if (candidate.volume6hUsd < config.minCandidateVolumeUsd) {
-      rejected.push(rejectWith(candidate, 'VOLUME_TOO_LOW'));
-      continue;
-    }
-    if (candidate.marketCapUsd == null) {
-      rejected.push(rejectWith(candidate, 'MC_UNKNOWN'));
-      continue;
-    }
-    if (candidate.marketCapUsd < config.minMarketCapUsd) {
-      rejected.push(rejectWith(candidate, 'MC_TOO_LOW'));
-      continue;
-    }
-    if (candidate.classification === 'UNKNOWN') {
-      rejected.push(rejectWith(candidate, 'CLASSIFICATION_UNKNOWN'));
-      continue;
-    }
-    afterBaseFilters.push(candidate);
+    afterBaseFilters.push(outcome.candidate);
   }
 
   // Token age is not present in trending payload — requires a secondary per-token lookup.
@@ -185,17 +208,12 @@ export async function fetchAndFilterCandidates(
     const settled = infoResults[i];
     const info = settled.status === 'fulfilled' ? settled.value : null;
     const ageHours = ageHoursFromInfo(info, now);
-    const withAge: MultiCandidate = { ...candidate, ageHours };
-
-    if (ageHours == null) {
-      rejected.push(rejectWith(withAge, 'AGE_UNKNOWN'));
+    const outcome = evaluateAgeFilter(candidate, ageHours, config);
+    if (!outcome.eligible) {
+      rejected.push(rejectWith(outcome.candidate, outcome.reason));
       continue;
     }
-    if (ageHours < config.minTokenAgeHours) {
-      rejected.push(rejectWith(withAge, 'AGE_TOO_LOW'));
-      continue;
-    }
-    afterAgeFilter.push(withAge);
+    afterAgeFilter.push(outcome.candidate);
   }
 
   const ranked = afterAgeFilter.slice().sort(compareCandidates);
@@ -212,4 +230,96 @@ export async function fetchAndFilterCandidates(
   }));
 
   return { candidates: top, rejected };
+}
+
+/**
+ * Phase 4.7 audit (F-10) result of re-checking ONE candidate's eligibility
+ * at Execute time, against live GMGN data, using the exact same rules
+ * (evaluateBaseFilters/evaluateAgeFilter) as the original batch scan.
+ *
+ * Deliberately distinct from `sourceError` in fetchAndFilterCandidates:
+ * `REVALIDATION_SOURCE_ERROR` covers every GMGN failure mode (timeout,
+ * non-zero exit, malformed output, rate limit) uniformly, and — critically —
+ * is never treated as "the source responded and this token failed" and
+ * never falls back to the stale cached candidate. A source failure at
+ * Execute time means eligibility is UNKNOWN, not "still eligible" and not
+ * "now ineligible" — so it fails closed exactly like a genuine rejection
+ * from the caller's point of view (Execute is refused either way), without
+ * ever conflating "GMGN is down" with "this token failed my filters".
+ */
+export type RevalidationResult =
+  | { status: 'OK'; candidate: MultiCandidate }
+  | { status: 'REJECTED'; reason: string; candidate: MultiCandidate }
+  | { status: 'CANDIDATE_NOT_FOUND' }
+  | { status: 'REVALIDATION_SOURCE_ERROR'; message: string };
+
+/**
+ * gmgnTokenInfo (unlike defaultInfoFetcher, which swallows failures to
+ * `null` for the batch scan's best-effort per-candidate age lookup) is
+ * called directly here so a genuine network/exec failure propagates as a
+ * catchable error — required to distinguish "GMGN failed" (source error)
+ * from "GMGN succeeded but returned no usable age timestamps" (AGE_UNKNOWN,
+ * a data-quality verdict, not an outage).
+ */
+const defaultRevalidationInfoFetcher: TokenInfoFetcher = (chainId, address) =>
+  gmgnTokenInfo(chainId, address as Address);
+
+/**
+ * Re-validates exactly ONE token — never re-fetches/re-scores the other
+ * ~50 Top-N candidates, never re-runs pool discovery. Cost is bounded to
+ * one `market trending` call (to find this token's current 6h figures;
+ * GMGN has no single-address trending query) plus one `token info` call
+ * (for age) — the same two data sources the original scan already uses,
+ * just not fanned out across every candidate.
+ */
+export async function revalidateCandidate(
+  config: MultiConfig,
+  tokenAddress: string,
+  opts?: { fetcher?: CandidateFetcher; infoFetcher?: TokenInfoFetcher; now?: number },
+): Promise<RevalidationResult> {
+  const fetcher = opts?.fetcher ?? defaultFetcher;
+  const infoFetcher = opts?.infoFetcher ?? defaultRevalidationInfoFetcher;
+  const now = opts?.now ?? Date.now();
+  const target = tokenAddress.toLowerCase();
+
+  let raw: GmgnTrendingToken[];
+  try {
+    raw = await fetcher({ chainId: config.chainId, interval: '6h', limit: 100 });
+  } catch (e) {
+    const code = e instanceof GmgnError ? e.code : 'CANDIDATE_SOURCE_UNKNOWN_ERROR';
+    const message = e instanceof Error ? e.message : String(e);
+    return { status: 'REVALIDATION_SOURCE_ERROR', message: `${code}: ${message}` };
+  }
+
+  const match = raw.find(
+    (t) => t && typeof t.address === 'string' && t.address.toLowerCase() === target,
+  );
+  if (!match) {
+    return { status: 'CANDIDATE_NOT_FOUND' };
+  }
+
+  const candidate = makeBaseCandidate(match, config.chainId, now);
+  const baseOutcome = evaluateBaseFilters(candidate, config);
+  if (!baseOutcome.eligible) {
+    return { status: 'REJECTED', reason: baseOutcome.reason, candidate: baseOutcome.candidate };
+  }
+
+  let info: GmgnTokenInfo;
+  try {
+    info = await infoFetcher(config.chainId, candidate.address).then((v) => {
+      if (v == null) throw new Error('gmgnTokenInfo returned null');
+      return v;
+    });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { status: 'REVALIDATION_SOURCE_ERROR', message };
+  }
+
+  const ageHours = ageHoursFromInfo(info, now);
+  const ageOutcome = evaluateAgeFilter(baseOutcome.candidate, ageHours, config);
+  if (!ageOutcome.eligible) {
+    return { status: 'REJECTED', reason: ageOutcome.reason, candidate: ageOutcome.candidate };
+  }
+
+  return { status: 'OK', candidate: ageOutcome.candidate };
 }

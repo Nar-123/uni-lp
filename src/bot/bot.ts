@@ -100,13 +100,18 @@ import {
   validateMultiConfig,
   getActiveStrategyName,
   runMultiStrategy,
-  executeTradeIntent,
+  executeTradeIntentFromSnapshot,
   type MultiConfig,
   type MultiStrategyRun,
   type TradeIntent,
   type MultiCandidate,
   type RejectedCandidate,
 } from '../strategy/index.js';
+import {
+  buildMultiExecuteCallbackData,
+  parseMultiExecuteCallback,
+  resolveMultiExecuteCallback,
+} from './multiExecuteResolver.js';
 import type { Address } from 'viem';
 
 /** Confirm-mint keyboard: refresh recomputes range + spot from live pool tick. */
@@ -1706,26 +1711,57 @@ export function createBot(): Bot {
     await runMultiDryRunReport(ctx, true);
   });
 
-  bot.callbackQuery(/^multi:exec:(0x[a-fA-F0-9]{40})$/, async (ctx) => {
+  // Phase 4.7 audit (F-13): matches ONLY the new mx:<scanId>:<token>
+  // format. The pre-F-13 `multi:exec:<token>` format (no scanId) simply
+  // does not match this regex at all — an old button surviving from before
+  // this change fails closed by construction, not via an explicit
+  // version/compatibility check.
+  bot.callbackQuery(/^mx:[0-9a-f]{10}:0x[a-fA-F0-9]{40}$/, async (ctx) => {
     if (!(await requireAuth(ctx))) return;
     if (getActiveStrategyName() !== 'multi') {
       await ctx.answerCallbackQuery({ text: 'MULTI is not active (STRATEGY=multi required)' });
       return;
     }
-    const token = ctx.match![1];
-    const sess = getSession(ctx.from!.id);
-    const run = sess.multiRun;
-    const intent = run?.intents.find((i) => i.token.toLowerCase() === token.toLowerCase());
-    const candidate = run?.candidates.find((c) => c.address.toLowerCase() === token.toLowerCase());
-    if (!run || !intent || !candidate) {
+    const parsed = parseMultiExecuteCallback(ctx.callbackQuery?.data ?? '');
+    if (!parsed) {
+      // Regex above already guarantees a match reaches here, but the
+      // strict parser is the single source of truth for the callback
+      // shape — never trust the regex alone for anything beyond routing.
       await ctx.answerCallbackQuery({ text: 'Stale — run /multi again' });
+      return;
+    }
+    const sess = getSession(ctx.from!.id);
+    const resolution = resolveMultiExecuteCallback(sess.multiRun, parsed);
+    // Phase 4.7 audit (F-13): scanId mismatch — including the case where a
+    // NEWER scan has since replaced the session and happens to contain the
+    // SAME token address under a different pool/intent — is rejected here,
+    // before any GMGN call, risk gate, F-08 check, or mint attempt. This is
+    // the central F-13 requirement: never resolve a callback against
+    // anything other than the exact scan that produced it.
+    if (!resolution.ok) {
+      await ctx.answerCallbackQuery({ text: 'Stale — run /multi again' });
+      return;
+    }
+    const { run, intent, candidate } = resolution;
+    const config = loadMultiConfig(run.chainId);
+    // Phase 4.7 audit (F-10): checked after scan/token binding, per the
+    // established order — "no scan at all"/"wrong scan" and "right scan,
+    // too old" are surfaced as distinct reasons, both failing closed
+    // identically (Execute refused either way).
+    if (Date.now() - run.timestamp > config.snapshotTtlMs) {
+      await ctx.answerCallbackQuery({ text: 'Scan expired — run /multi again' });
       return;
     }
     await ctx.answerCallbackQuery({ text: 'Executing…' });
     try {
-      const config = loadMultiConfig(run.chainId);
       const prefs = getUserPrefs(ctx.from!.id);
-      const outcome = await executeTradeIntent({ intent, candidate, config, prefs });
+      const outcome = await executeTradeIntentFromSnapshot({
+        intent,
+        candidate,
+        config,
+        prefs,
+        snapshotTimestamp: run.timestamp,
+      });
       if ('skipped' in outcome) {
         await ctx.reply(`⛔ Execution blocked: ${outcome.reason}`);
       } else {
@@ -5909,7 +5945,10 @@ function multiKeyboard(run: MultiStrategyRun): InlineKeyboard {
   for (const intent of run.intents) {
     const c = run.candidates.find((x) => x.address.toLowerCase() === intent.token.toLowerCase());
     const label = c ? `🚀 Execute ${c.symbol}` : `🚀 Execute ${intent.token.slice(0, 8)}`;
-    kb.text(label.slice(0, 60), `multi:exec:${intent.token}`).row();
+    // Phase 4.7 audit (F-13): every button embeds THIS scan's own scanId —
+    // never regenerated per button, per report, or per refresh — so a
+    // callback can only ever resolve against the exact run that produced it.
+    kb.text(label.slice(0, 60), buildMultiExecuteCallbackData(run.scanId, intent.token)).row();
   }
   kb.text('🔄 Refresh', 'multi:refresh');
   return kb;

@@ -1,4 +1,5 @@
 import type { Address, Hex } from 'viem';
+import { randomUUID } from 'node:crypto';
 import type { SupportedChainId } from '../config.js';
 import { loadPool, verifyOnChainPoolReserves } from '../chain/pools.js';
 import { loadV4Pool, verifyV4PoolHasLiquidity } from '../chain/v4.js';
@@ -14,10 +15,23 @@ import {
   setPositionTpSl,
   type UserPrefs,
 } from '../db/index.js';
-import { fetchAndFilterCandidates, type CandidateFetcher, type TokenInfoFetcher } from './multiCandidates.js';
+import {
+  fetchAndFilterCandidates,
+  revalidateCandidate,
+  type CandidateFetcher,
+  type RevalidationResult,
+  type TokenInfoFetcher,
+} from './multiCandidates.js';
 import { discoverAndScorePoolsForCandidate, type PoolFetcher } from './multiPool.js';
 import { computeMultiRange } from './multiRange.js';
 import { checkPendingTransaction, recordEntryCooldown, runRiskGate } from './multiRisk.js';
+import {
+  executionLockKey,
+  globalReservationKey,
+  releaseExecutionLock,
+  tryAcquireExecutionLock,
+} from './executionLock.js';
+import { getHotWalletAddress } from '../chain/clients.js';
 import type { MultiConfig } from './multiConfig.js';
 import type {
   MultiCandidate,
@@ -269,6 +283,180 @@ export async function executeTradeIntent(params: {
   return { tokenId, txHash: result.hash };
 }
 
+/** Injectable — defaults to the real revalidateCandidate; kept mockable for tests, matching every other external dependency in this pipeline. */
+export type RevalidateFn = (
+  config: MultiConfig,
+  tokenAddress: string,
+  opts?: { now?: number },
+) => Promise<RevalidationResult>;
+
+const defaultRevalidate: RevalidateFn = (config, tokenAddress, opts) =>
+  revalidateCandidate(config, tokenAddress, opts);
+
+/**
+ * Phase 4.7 audit (F-10 + TOCTOU + F-11 global reservation) — the
+ * Telegram-session-aware entry point for a MULTI Execute button press.
+ * `executeTradeIntent` itself stays exactly as it was (a pure execution
+ * engine with no notion of "sessions", "snapshot age", or locking) — this
+ * wrapper adds everything only the session/concurrency layer needs to know:
+ * how old the cached scan is, whether another Execute for this exact token
+ * is already in flight, and — F-11 — whether ANY other MULTI execution for
+ * this wallet is currently between its risk decision and its durable
+ * outcome (which the per-token lock alone cannot detect, since two
+ * different tokens acquire two different per-token keys).
+ *
+ * Ordering, deliberately, and NOT a blind copy of a suggested diagram:
+ *
+ *   TTL check → per-token lock → GLOBAL reservation → revalidation →
+ *   executeTradeIntent (risk gate → F-08 → sizing → mintFn) →
+ *   release GLOBAL reservation → release per-token lock
+ *
+ * Both locks are acquired BEFORE revalidation (which makes real GMGN
+ * network calls) for the same reason F-10 already established for the
+ * per-token lock alone: a rejected attempt costs zero wasted API calls,
+ * rather than both contenders redundantly re-fetching the same data before
+ * either discovers it lost the race.
+ *
+ * Per-token lock acquired FIRST, global reservation SECOND (the reverse of
+ * this task's own suggested diagram) — deliberate, documented deviation:
+ * placing the global reservation first would mean a same-token double-press
+ * is intercepted by the (token-agnostic) global gate before ever reaching
+ * the per-token lock, making the per-token lock's own distinct
+ * EXECUTION_IN_PROGRESS outcome unreachable for that exact case and
+ * silently changing already-tested F-10 behavior. Acquiring per-token
+ * first preserves that existing, specific outcome unchanged, while the
+ * global reservation — checked second — still fully closes the
+ * cross-token race: a different token still cannot proceed past it while
+ * any other token's attempt holds it. There is exactly one place in this
+ * codebase that acquires both locks, always in this same order, so no
+ * opposite-order acquisition — and therefore no deadlock — is possible.
+ * Release order is the mirror image (global first, then per-token),
+ * standard reverse-of-acquisition nesting.
+ *
+ * The global reservation is held for the SAME interval as the per-token
+ * lock — through revalidation, runRiskGate, F-08, sizing, mintFn, and the
+ * post-mint accounting writes inside executeTradeIntent — not released
+ * early after runRiskGate. Releasing it as soon as runRiskGate passes would
+ * defeat its entire purpose: another token's concurrent attempt would then
+ * be free to run its own runRiskGate against the same not-yet-updated
+ * open-position/exposure state.
+ *
+ * Scope boundary, explicit: both locks live here, not inside
+ * executeTradeIntent itself. runMultiStrategy's own internal dryRun:false
+ * loop (confirmed, again, to have zero production callers — grep
+ * `runMultiStrategy(` finds exactly one call site, in bot.ts, always
+ * `dryRun: true`) calls executeTradeIntent directly and therefore is NOT
+ * covered by either lock. This is an intentional, currently-inert gap, not
+ * an oversight: that loop processes its own candidates strictly
+ * sequentially (one `await executeTradeIntent(...)` per iteration, never
+ * fired concurrently with itself), so it cannot self-race; it also has no
+ * "session" to derive a snapshot age from, so TTL/revalidation do not apply
+ * to it either. It WOULD need equivalent locking if it is ever invoked
+ * concurrently by more than one caller in the future (e.g. a scheduled
+ * auto-execute feature) — flagged here precisely so that future work does
+ * not silently inherit weaker protection than the Telegram path.
+ */
+export async function executeTradeIntentFromSnapshot(params: {
+  intent: TradeIntent;
+  candidate: MultiCandidate;
+  config: MultiConfig;
+  prefs: UserPrefs;
+  /** MultiStrategyRun.timestamp — when the Telegram-cached scan was taken. */
+  snapshotTimestamp: number;
+  mintFn?: MintFn;
+  verifyLiquidityFn?: LiquidityCheckFn;
+  revalidateFn?: RevalidateFn;
+  now?: number;
+}): Promise<{ tokenId: string; txHash: string } | { skipped: true; reason: string }> {
+  const { intent, config, prefs, snapshotTimestamp } = params;
+  const now = params.now ?? Date.now();
+  const revalidateFn = params.revalidateFn ?? defaultRevalidate;
+
+  if (now - snapshotTimestamp > config.snapshotTtlMs) {
+    return { skipped: true, reason: 'SNAPSHOT_EXPIRED' };
+  }
+
+  const wallet = getHotWalletAddress();
+  const lockKey = executionLockKey(intent.chainId, wallet, intent.token);
+  if (!tryAcquireExecutionLock(lockKey)) {
+    return { skipped: true, reason: 'EXECUTION_IN_PROGRESS' };
+  }
+
+  try {
+    // F-11: a second, wallet-wide (not token-specific) reservation. Without
+    // this, two DIFFERENT tokens — each acquiring its own distinct
+    // per-token lock above without conflict — could both pass
+    // multiRisk.ts's checkPositionLimits (MULTI_MAX_OPEN_POSITIONS /
+    // MULTI_MAX_EXPOSURE_USD) by both reading the same stale
+    // listOpenPositions() state before either had durably recorded a
+    // position. This reservation makes that read-decide-act sequence
+    // single-flight across the whole wallet, for every MULTI token at once.
+    const globalKey = globalReservationKey(intent.chainId, wallet);
+    if (!tryAcquireExecutionLock(globalKey)) {
+      return { skipped: true, reason: 'GLOBAL_EXECUTION_IN_PROGRESS' };
+    }
+
+    try {
+      const revalidation = await revalidateFn(config, intent.token, { now });
+      if (revalidation.status === 'REVALIDATION_SOURCE_ERROR') {
+        return { skipped: true, reason: 'REVALIDATION_SOURCE_ERROR' };
+      }
+      if (revalidation.status === 'CANDIDATE_NOT_FOUND') {
+        return { skipped: true, reason: 'CANDIDATE_NOT_FOUND' };
+      }
+      if (revalidation.status === 'REJECTED') {
+        return { skipped: true, reason: revalidation.reason };
+      }
+
+      // revalidation.status === 'OK': eligibility reconfirmed with fresh data.
+      // The intent itself (pool/range/sizing inputs) is NOT rebuilt from this
+      // fresh candidate — F-08/F-09 already independently re-verify the pool
+      // at the on-chain level inside executeTradeIntent, and rebuilding
+      // pool/range here would mean re-running pool discovery/scoring, exactly
+      // what this phase is scoped NOT to do. The freshly-revalidated candidate
+      // IS used for accounting (recordMultiPositionMeta's candidate* fields),
+      // so the historical record reflects what was actually true at the
+      // moment capital moved, not the original (now provably stale) scan.
+      //
+      // runRiskGate (inside executeTradeIntent) is the SAME, unmodified risk
+      // calculation as before — this reservation only serializes access to
+      // it, it never duplicates or second-guesses its decision.
+      return await executeTradeIntent({
+        intent,
+        candidate: revalidation.candidate,
+        config,
+        prefs,
+        mintFn: params.mintFn,
+        verifyLiquidityFn: params.verifyLiquidityFn,
+      });
+    } finally {
+      releaseExecutionLock(globalKey);
+    }
+  } finally {
+    releaseExecutionLock(lockKey);
+  }
+}
+
+/**
+ * Phase 4.7 audit (F-13) — a fresh, opaque scan identifier, generated
+ * exactly once per runMultiStrategy call (see below — never regenerated
+ * for report formatting, button building, refresh, or execute).
+ *
+ * 10 lowercase hex characters (40 bits of entropy) taken from the
+ * fully-random prefix of a v4 UUID (the version/variant marker nibbles
+ * live later in the string, at de-hyphenated position 12+, so slicing the
+ * first 10 characters never includes a constrained bit) — deliberately
+ * short: Telegram's callback_data has a hard 64-byte limit, and the actual
+ * callback also carries a 42-character token address plus a short prefix,
+ * so the scan-id budget is real, not cosmetic (see bot.ts's `mx:` callback
+ * format). 40 bits (~1.1 trillion possible values) is far more entropy
+ * than this bot's realistic scan volume could ever meaningfully collide
+ * against — this is a collision-resistant tag, not a security secret.
+ */
+export function generateScanId(): string {
+  return randomUUID().replace(/-/g, '').slice(0, 10);
+}
+
 /**
  * Runs the full MULTI pipeline: fetch/filter candidates → discover/score
  * pools → compute range → risk gate → (dry-run: stop here) or execute.
@@ -290,8 +478,13 @@ export async function runMultiStrategy(
 ): Promise<MultiStrategyRun> {
   const now = opts?.now ?? Date.now();
   const dryRun = opts?.dryRun ?? true;
+  // Generated exactly once per call, up front, so both the early "empty"
+  // return (config disabled / pending tx) and the full return below share
+  // the exact same identifier for this one scan.
+  const scanId = generateScanId();
 
   const empty: MultiStrategyRun = {
+    scanId,
     chainId: config.chainId,
     dryRun,
     timestamp: now,
@@ -410,5 +603,5 @@ export async function runMultiStrategy(
     }
   }
 
-  return { chainId: config.chainId, dryRun, timestamp: now, candidates, rejected, intents, executed, sourceError };
+  return { scanId, chainId: config.chainId, dryRun, timestamp: now, candidates, rejected, intents, executed, sourceError };
 }

@@ -40,6 +40,20 @@ export type MultiConfig = {
   entryCooldownMs: number;
   tpPercent: number;
   slPercent: number;
+  /**
+   * Phase 4.7 audit (F-10) — maximum age (ms) of a Telegram-session MULTI
+   * scan snapshot (`MultiStrategyRun.timestamp`) before its Execute button
+   * is refused outright (SNAPSHOT_EXPIRED), without even attempting a
+   * single-candidate revalidation. Default 10 minutes: long enough for a
+   * human to actually read a multi-candidate report and decide (5 minutes —
+   * matching this codebase's own MULTI_ENTRY_COOLDOWN_MS default — was
+   * judged too tight for realistic review time under normal Telegram usage;
+   * 15 minutes was judged too loose given how quickly a meme-token's
+   * volume/market-cap can move, which is exactly the volatility this
+   * feature exists to bound). Always finite and positive — validated below,
+   * never silently infinite.
+   */
+  snapshotTtlMs: number;
 };
 
 /** Reads STRATEGY env var — 'multi' opts in explicitly, anything else (incl. unset) is 'default'. */
@@ -159,6 +173,7 @@ export function loadMultiConfig(chainId?: SupportedChainId): MultiConfig {
     entryCooldownMs: Math.round(envNum('MULTI_ENTRY_COOLDOWN_MS', 300_000)),
     tpPercent: envNum('MULTI_TP_PERCENT', 10),
     slPercent: envNum('MULTI_SL_PERCENT', 15),
+    snapshotTtlMs: Math.round(envNum('MULTI_SNAPSHOT_TTL_MS', 600_000)),
   };
 
   const validation = validateMultiConfig(base);
@@ -181,6 +196,9 @@ export function validateMultiConfig(c: MultiConfig): { valid: boolean; reason?: 
   }
   if (!(c.minCandidateVolumeUsd >= 0)) {
     return { valid: false, reason: 'MULTI_MIN_CANDIDATE_VOLUME_USD must be >= 0' };
+  }
+  if (!(c.snapshotTtlMs > 0)) {
+    return { valid: false, reason: 'MULTI_SNAPSHOT_TTL_MS must be > 0 (finite, positive — never effectively infinite)' };
   }
   if (!(c.topN > 0)) {
     return { valid: false, reason: 'MULTI_TOP_N must be > 0' };

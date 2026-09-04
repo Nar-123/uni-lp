@@ -457,21 +457,37 @@ export async function getTokenPriceUsd(
         }
       }
     }
-    // Last resort: ETH price from ethereum mainnet WETH
-    try {
-      const ethPairs = await fetchTokenPairs('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2');
-      const ethBest = ethPairs
-        .filter((p) => p.chainId === 'ethereum')
-        .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
-      if (ethBest?.priceUsd) {
-        const px = Number(ethBest.priceUsd);
-        if (px > 10 && px < 1_000_000) {
-          setPriceCacheBounded(key, { usd: px, at: Date.now(), source: 'dexscreener-eth-mainnet-fallback' });
-          return px;
+    // Last resort: ETH price from ethereum mainnet WETH.
+    //
+    // P2-1 fix: this is only a valid proxy when the CURRENT chain's own
+    // native asset is actually ETH (Robinhood Chain, Base) — Ethereum
+    // mainnet WETH's price has no economic relationship to a chain whose
+    // native asset is something else (BSC's BNB). Gated on the chain's own
+    // `nativeSymbol` (existing chain metadata, config.ts — not a new
+    // chain-definition system) rather than being applied unconditionally
+    // to "whatever token happens to be `c.wrapped`". A BNB-native chain
+    // reaching this point with no local pair/stable-pair data falls
+    // through to `return null` below — fail closed, never a fabricated or
+    // wrong-asset price. There is no existing chain-correct BNB oracle in
+    // this codebase to substitute here without inventing one, and this
+    // codebase's own invariant (safety.ts: "UNKNOWN !== ZERO, UNKNOWN !==
+    // VALID") is exactly the one to honor when no such source exists.
+    if (c.nativeSymbol === 'ETH') {
+      try {
+        const ethPairs = await fetchTokenPairs('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2');
+        const ethBest = ethPairs
+          .filter((p) => p.chainId === 'ethereum')
+          .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0))[0];
+        if (ethBest?.priceUsd) {
+          const px = Number(ethBest.priceUsd);
+          if (px > 10 && px < 1_000_000) {
+            setPriceCacheBounded(key, { usd: px, at: Date.now(), source: 'dexscreener-eth-mainnet-fallback' });
+            return px;
+          }
         }
+      } catch {
+        /* ignore */
       }
-    } catch {
-      /* ignore */
     }
   }
 

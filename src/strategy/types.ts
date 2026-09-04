@@ -104,6 +104,19 @@ export type MultiPositionMeta = {
 };
 
 export type MultiStrategyRun = {
+  /**
+   * Phase 4.7 audit (F-13) — a fresh, opaque, cryptographically-random
+   * identifier generated exactly once per scan (see multiExecute.ts's
+   * generateScanId, called once in runMultiStrategy). Every Telegram
+   * Execute button built from this run embeds this same scanId; a callback
+   * is only ever resolved if it matches the CURRENT session's run.scanId
+   * exactly — an old button from a since-replaced scan can never resolve
+   * against a newer run, even if both scans happen to include the same
+   * token address. Not a secret — just a collision-resistant tag, never
+   * regenerated for the same scan (not on refresh-formatting, not on
+   * button-building, not on execute).
+   */
+  scanId: string;
   chainId: SupportedChainId;
   dryRun: boolean;
   timestamp: number;
