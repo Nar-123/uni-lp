@@ -25,6 +25,7 @@ import {
   v4PositionManagerAbi,
 } from './abis.js';
 import { getHotWalletAddress, getPublicClient, getWalletClient } from './clients.js';
+import type { MinimalReadClient } from './quote.js';
 import { estimateWriteGas } from './gas.js';
 import {
   Token,
@@ -876,6 +877,79 @@ export async function listV4PoolsForToken(
   });
   unique.sort((a, b) => b.tvlUsd - a.tvlUsd);
   return unique;
+}
+
+/**
+ * Phase 4.7 audit (F-08), V4-specific counterpart to
+ * pools.ts's verifyOnChainPoolReserves. Deliberately NOT the same
+ * balanceOf-based reserve check used for V3: V4 uses a single shared
+ * PoolManager singleton that custodies the combined funds of every pool on
+ * the chain at once, so `balanceOf(poolManager)` for a currency says
+ * nothing about any one specific pool's share of it — there is no
+ * per-pool ERC20 balance to read for V4, and computing a true per-pool USD
+ * TVL would require integrating LP liquidity across every initialized tick
+ * range, which is not a formula this codebase already has any tested
+ * implementation of. Per the audit's explicit instruction not to invent a
+ * TVL formula and not to apply V3 semantics to V4, this intentionally stays
+ * a narrower, non-invented check: does the pool identified by `poolId`
+ * currently carry ANY active on-chain liquidity at its current price at
+ * all (`StateView.getLiquidity`, the same authoritative call already used
+ * elsewhere in this file for position/pool state — see getV4Position and
+ * loadV4Pool)? A pool with zero current liquidity cannot back a real
+ * position (a mint into it would either revert or receive worthless
+ * liquidity), regardless of what DexScreener/the explore API separately
+ * claim its TVL is — so this catches "fully drained/rugged/never-actually-
+ * initialized pool" without needing a USD figure. It does NOT catch "real
+ * but thin" liquidity, unlike V3's dollar-based floor; this residual gap is
+ * a known, documented limitation of V4's architecture, not an oversight.
+ */
+export type V4LiquidityCheckResult =
+  | { status: 'OK'; liquidity: bigint }
+  | { status: 'ONCHAIN_VALIDATION_ERROR'; message: string }
+  | { status: 'TVL_MISMATCH'; liquidity: bigint };
+
+/**
+ * Pure decision logic — see classifyOnChainReserves in pools.ts for why this
+ * is split from the RPC read below. Takes `unknown` (not `bigint`) because
+ * the RPC wrapper's `as bigint` cast is only a compile-time assertion — a
+ * malformed response (wrong ABI decode, a mocked/buggy client) would
+ * otherwise reach `liquidity <= 0n`, which JS resolves to `false` for any
+ * non-bigint value including `undefined`, silently falling through to `OK`
+ * instead of failing closed.
+ */
+export function classifyV4Liquidity(liquidity: unknown): V4LiquidityCheckResult {
+  if (typeof liquidity !== 'bigint') {
+    return {
+      status: 'ONCHAIN_VALIDATION_ERROR',
+      message: `StateView.getLiquidity returned a non-bigint value (${typeof liquidity}) — refusing to classify`,
+    };
+  }
+  if (liquidity <= 0n) {
+    return { status: 'TVL_MISMATCH', liquidity };
+  }
+  return { status: 'OK', liquidity };
+}
+
+export async function verifyV4PoolHasLiquidity(
+  chainId: SupportedChainId,
+  poolId: Hex,
+  client: MinimalReadClient = getPublicClient(chainId),
+): Promise<V4LiquidityCheckResult> {
+  let liquidity: bigint;
+  try {
+    liquidity = (await client.readContract({
+      address: CHAINS[chainId].v4StateView,
+      abi: stateViewAbi,
+      functionName: 'getLiquidity',
+      args: [poolId],
+    })) as bigint;
+  } catch (e) {
+    return {
+      status: 'ONCHAIN_VALIDATION_ERROR',
+      message: `StateView.getLiquidity failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+  return classifyV4Liquidity(liquidity);
 }
 
 export async function loadV4Pool(

@@ -1,7 +1,7 @@
 import type { Address, Hex } from 'viem';
 import type { SupportedChainId } from '../config.js';
-import { loadPool } from '../chain/pools.js';
-import { loadV4Pool } from '../chain/v4.js';
+import { loadPool, verifyOnChainPoolReserves } from '../chain/pools.js';
+import { loadV4Pool, verifyV4PoolHasLiquidity } from '../chain/v4.js';
 import { mintSingleSided, type MintParamsWithProtocol, type MintResult } from '../chain/mint.js';
 import { getTokenMeta, humanToFloat } from '../chain/tokens.js';
 import { getTokenPriceUsd } from '../price/dexscreener.js';
@@ -28,6 +28,27 @@ import type {
 } from './types.js';
 
 export type MintFn = (params: MintParamsWithProtocol) => Promise<MintResult>;
+
+/**
+ * Injectable, matching the existing mintFn/poolFetcher/fetcher pattern —
+ * keeps executeTradeIntent's real-RPC dependencies mockable in tests
+ * without any network access, same as every other external call in this
+ * pipeline. Defaults to the real on-chain check dispatched by protocol.
+ */
+export type LiquidityCheckFn = (
+  intent: TradeIntent,
+) => Promise<{ status: 'OK' | 'ONCHAIN_VALIDATION_ERROR' | 'TVL_MISMATCH' }>;
+
+const defaultVerifyLiquidity: LiquidityCheckFn = (intent) =>
+  intent.pool.protocol === 'v4'
+    ? verifyV4PoolHasLiquidity(intent.chainId, intent.pool.poolAddress as Hex)
+    : verifyOnChainPoolReserves(
+        intent.chainId,
+        intent.pool.poolAddress as Address,
+        intent.token as Address,
+        intent.quoteToken as Address,
+        intent.pool.tvlUsd ?? 0,
+      );
 
 type LivePoolState = {
   currentTick: number;
@@ -80,9 +101,11 @@ export async function executeTradeIntent(params: {
   config: MultiConfig;
   prefs: UserPrefs;
   mintFn?: MintFn;
+  verifyLiquidityFn?: LiquidityCheckFn;
 }): Promise<{ tokenId: string; txHash: string } | { skipped: true; reason: string }> {
   const { intent, candidate, config, prefs } = params;
   const mintFn = params.mintFn ?? mintSingleSided;
+  const verifyLiquidityFn = params.verifyLiquidityFn ?? defaultVerifyLiquidity;
 
   // The execution layer re-validates — it never trusts the intent blindly,
   // even though it was assembled by our own strategy code moments earlier.
@@ -95,6 +118,19 @@ export async function executeTradeIntent(params: {
   const usdgAddress = config.usdgAddress;
   if (!usdgAddress) {
     return { skipped: true, reason: 'NOT_USDG' };
+  }
+
+  // Phase 4.7 audit (F-08): DexScreener's pool.tvlUsd (scored/ranked in
+  // multiPool.ts, left untouched by this check) is never independently
+  // verified on-chain before this point. Re-verifying only here — once, for
+  // the single candidate about to receive a real deposit, not for every
+  // Top-N candidate during a dry-run scan — keeps this bounded to exactly
+  // one additional on-chain check per real execution (see the RPC-impact
+  // note in each verify function's own doc comment). Fails closed: any
+  // classification other than OK aborts the trade before any capital moves.
+  const liquidityCheck = await verifyLiquidityFn(intent);
+  if (liquidityCheck.status !== 'OK') {
+    return { skipped: true, reason: liquidityCheck.status };
   }
 
   let sizeMode: 'percent' | 'fixed' = 'fixed';
@@ -249,6 +285,7 @@ export async function runMultiStrategy(
     poolFetcher?: PoolFetcher;
     prefs?: UserPrefs;
     now?: number;
+    verifyLiquidityFn?: LiquidityCheckFn;
   },
 ): Promise<MultiStrategyRun> {
   const now = opts?.now ?? Date.now();
@@ -363,6 +400,7 @@ export async function runMultiStrategy(
         config,
         prefs,
         mintFn: opts?.mintFn,
+        verifyLiquidityFn: opts?.verifyLiquidityFn,
       });
       if ('skipped' in outcome) {
         rejected.push(rejectCandidate(candidate, outcome.reason));

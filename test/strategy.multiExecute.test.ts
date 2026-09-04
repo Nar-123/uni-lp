@@ -331,6 +331,7 @@ test('executeTradeIntent: a mintFn failure (quote/simulation/gas failure inside 
     candidate: baseCandidate(token) as never,
     config: cfg as never,
     prefs: { sizeMode: 'fixed', fixedAmountHuman: 10, balancePercent: 0 } as never,
+    verifyLiquidityFn: async () => ({ status: 'OK' }),
     mintFn: async () => {
       mintCalls++;
       throw new Error('quote unavailable / simulation reverted / gas estimation failed');
@@ -464,6 +465,126 @@ test('live run: an unresolved pending transaction blocks the entire strategy run
   assert.equal(fetcherCalled, false, 'a pending unresolved tx must block before candidate fetch, not after');
   assert.equal(mintCalls, 0);
   assert.equal(run.executed.length, 0);
+});
+
+// ── F-08 wiring: on-chain liquidity check gates execution ────────────────
+
+test('F-08: executeTradeIntent aborts with TVL_MISMATCH before minting when the on-chain liquidity check fails, mintFn never invoked', async () => {
+  resetDb();
+  __resetMultiCooldownForTests();
+  const cfg = baseConfig();
+  const token = freshToken();
+  const intent = baseIntent(token);
+
+  let mintCalls = 0;
+  let checkCalls = 0;
+  const outcome = await executeTradeIntent({
+    intent: intent as never,
+    candidate: baseCandidate(token) as never,
+    config: cfg as never,
+    prefs: { sizeMode: 'fixed', fixedAmountHuman: 10, balancePercent: 0 } as never,
+    verifyLiquidityFn: async () => {
+      checkCalls++;
+      return { status: 'TVL_MISMATCH' };
+    },
+    mintFn: async () => {
+      mintCalls++;
+      throw new Error('must not be called — liquidity check should have aborted first');
+    },
+  });
+
+  assert.equal(checkCalls, 1);
+  assert.equal(mintCalls, 0, 'mintFn must never be reached once the on-chain liquidity check fails');
+  assert.ok('skipped' in outcome && outcome.skipped);
+  if ('skipped' in outcome) assert.equal(outcome.reason, 'TVL_MISMATCH');
+
+  const { listOpenPositions } = await import('../src/db/index.js');
+  assert.equal(listOpenPositions(CHAIN).length, 0, 'no position may be recorded for a trade that never minted');
+});
+
+test('F-08: executeTradeIntent aborts with ONCHAIN_VALIDATION_ERROR (RPC/price failure) rather than proceeding to mint', async () => {
+  resetDb();
+  __resetMultiCooldownForTests();
+  const cfg = baseConfig();
+  const token = freshToken();
+  const intent = baseIntent(token);
+
+  let mintCalls = 0;
+  const outcome = await executeTradeIntent({
+    intent: intent as never,
+    candidate: baseCandidate(token) as never,
+    config: cfg as never,
+    prefs: { sizeMode: 'fixed', fixedAmountHuman: 10, balancePercent: 0 } as never,
+    verifyLiquidityFn: async () => ({ status: 'ONCHAIN_VALIDATION_ERROR' }),
+    mintFn: async () => {
+      mintCalls++;
+      throw new Error('must not be called');
+    },
+  });
+
+  assert.equal(mintCalls, 0);
+  assert.ok('skipped' in outcome && outcome.skipped);
+  if ('skipped' in outcome) assert.equal(outcome.reason, 'ONCHAIN_VALIDATION_ERROR');
+});
+
+test('F-08: executeTradeIntent proceeds to mintFn once the on-chain liquidity check passes (OK)', async () => {
+  resetDb();
+  __resetMultiCooldownForTests();
+  const cfg = baseConfig();
+  const token = freshToken();
+  const intent = baseIntent(token);
+
+  let mintCalls = 0;
+  const outcome = await executeTradeIntent({
+    intent: intent as never,
+    candidate: baseCandidate(token) as never,
+    config: cfg as never,
+    prefs: { sizeMode: 'fixed', fixedAmountHuman: 10, balancePercent: 0 } as never,
+    verifyLiquidityFn: async () => ({ status: 'OK' }),
+    mintFn: async () => {
+      mintCalls++;
+      throw new Error('stop here — proves mintFn was reached, not a real mint');
+    },
+  });
+
+  assert.equal(mintCalls, 1, 'a passing liquidity check must not block reaching the mint step');
+  assert.ok('skipped' in outcome && outcome.skipped);
+  if ('skipped' in outcome) assert.equal(outcome.reason, 'SIMULATION_FAILED');
+});
+
+test('F-08: the liquidity check runs after the risk gate, not before — a duplicate-position rejection still short-circuits first', async () => {
+  resetDb();
+  __resetMultiCooldownForTests();
+  const { recordOpenPosition } = await import('../src/db/index.js');
+  const token = freshToken();
+  recordOpenPosition({
+    chainId: CHAIN,
+    tokenId: 'pos-1',
+    poolAddress: '0xpool',
+    token0: USDG,
+    token1: token,
+    fee: 50_000,
+    tickLower: 0,
+    tickUpper: 100,
+    strategy: 'multi',
+  });
+
+  const cfg = baseConfig();
+  const intent = baseIntent(token);
+  let liquidityCheckCalls = 0;
+  const outcome = await executeTradeIntent({
+    intent: intent as never,
+    candidate: baseCandidate(token) as never,
+    config: cfg as never,
+    prefs: { sizeMode: 'fixed', fixedAmountHuman: 10, balancePercent: 0 } as never,
+    verifyLiquidityFn: async () => {
+      liquidityCheckCalls++;
+      return { status: 'OK' };
+    },
+  });
+
+  assert.equal(liquidityCheckCalls, 0, 'the on-chain liquidity check must not run RPC calls for a trade already blocked by the risk gate');
+  if ('skipped' in outcome) assert.equal(outcome.reason, 'DUPLICATE_POSITION');
 });
 
 test('disabled MULTI config (no usdgAddress) never fetches candidates or executes anything', async () => {

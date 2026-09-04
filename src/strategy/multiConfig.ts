@@ -9,6 +9,21 @@ export type MultiConfig = {
   interval: '6h';
   minMarketCapUsd: number;
   minTokenAgeHours: number;
+  /**
+   * Optional operator-chosen floor (USD) on candidate.volume6hUsd, ON TOP OF
+   * the always-on, non-configurable requirement that volume be strictly
+   * positive (see multiCandidates.ts's VOLUME_NON_POSITIVE check — a
+   * "trending" token reporting $0 or negative 6h volume is a data-integrity
+   * failure, not a risk-tolerance choice, so that check is not gated by this
+   * config value). Default 0 = disabled: no floor beyond "genuinely nonzero
+   * positive volume occurred". Phase 4.7 audit (F-07) deliberately does not
+   * hardcode a specific positive dollar figure here — there is no existing,
+   * defensible analytical basis in this codebase for picking one (unlike
+   * minMarketCapUsd, which has an explicit operator-set default) — so the
+   * operator must opt in to a stricter floor themselves once they have a
+   * reasoned number, rather than the code inventing one "to be safer".
+   */
+  minCandidateVolumeUsd: number;
   topN: number;
   rangePercent: number;
   /** null = fall back to the user's existing size prefs (UserPrefs) */
@@ -129,6 +144,7 @@ export function loadMultiConfig(chainId?: SupportedChainId): MultiConfig {
     interval: '6h',
     minMarketCapUsd: envNum('MULTI_MIN_MARKET_CAP_USD', 1_000_000),
     minTokenAgeHours: envNum('MULTI_MIN_TOKEN_AGE_HOURS', 24),
+    minCandidateVolumeUsd: envNum('MULTI_MIN_CANDIDATE_VOLUME_USD', 0),
     topN: Math.round(envNum('MULTI_TOP_N', 10)),
     rangePercent: envNum('MULTI_RANGE_PERCENT', 50),
     positionSizeUsd: envPositiveOrNull('MULTI_POSITION_SIZE_USD'),
@@ -162,6 +178,9 @@ export function validateMultiConfig(c: MultiConfig): { valid: boolean; reason?: 
   }
   if (!(c.minTokenAgeHours >= 0)) {
     return { valid: false, reason: 'MULTI_MIN_TOKEN_AGE_HOURS must be >= 0' };
+  }
+  if (!(c.minCandidateVolumeUsd >= 0)) {
+    return { valid: false, reason: 'MULTI_MIN_CANDIDATE_VOLUME_USD must be >= 0' };
   }
   if (!(c.topN > 0)) {
     return { valid: false, reason: 'MULTI_TOP_N must be > 0' };

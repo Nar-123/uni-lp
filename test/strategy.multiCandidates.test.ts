@@ -21,6 +21,7 @@ function baseConfig(overrides: Partial<MultiConfig> = {}): MultiConfig {
     interval: '6h',
     minMarketCapUsd: 1_000_000,
     minTokenAgeHours: 24,
+    minCandidateVolumeUsd: 0,
     topN: 10,
     rangePercent: 50,
     positionSizeUsd: null,
@@ -217,6 +218,161 @@ test('UNKNOWN volume fails closed as VOLUME_UNKNOWN', async () => {
   });
   assert.equal(candidates.length, 0);
   assert.equal(rejected[0].rejectedReason, 'VOLUME_UNKNOWN');
+});
+
+test('malformed volume (NaN) fails closed as VOLUME_UNKNOWN, not coerced to a number', async () => {
+  const cfg = baseConfig();
+  const t = token({ address: '0xaaa', volume: NaN });
+  const { candidates, rejected } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => [t],
+    infoFetcher: async () => infoAtAge(48),
+    now: NOW,
+  });
+  assert.equal(candidates.length, 0);
+  assert.equal(rejected[0].rejectedReason, 'VOLUME_UNKNOWN');
+});
+
+test('malformed volume (Infinity) fails closed as VOLUME_UNKNOWN', async () => {
+  const cfg = baseConfig();
+  const t = token({ address: '0xaaa', volume: Infinity });
+  const { rejected } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => [t],
+    infoFetcher: async () => infoAtAge(48),
+    now: NOW,
+  });
+  assert.equal(rejected[0].rejectedReason, 'VOLUME_UNKNOWN');
+});
+
+test('malformed volume (wrong type — a string, as a genuinely malformed API response might send) fails closed as VOLUME_UNKNOWN, never parsed/coerced', async () => {
+  const cfg = baseConfig();
+  const t = token({ address: '0xaaa', volume: '500000' as unknown as number });
+  const { candidates, rejected } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => [t],
+    infoFetcher: async () => infoAtAge(48),
+    now: NOW,
+  });
+  assert.equal(candidates.length, 0);
+  assert.equal(rejected[0].rejectedReason, 'VOLUME_UNKNOWN');
+});
+
+// ── F-07: minimum candidate volume (Phase 4.7 audit) ─────────────────────
+
+test('F-07 A: exactly $0 volume fails closed as VOLUME_NON_POSITIVE, even with no configured floor', async () => {
+  const cfg = baseConfig({ minCandidateVolumeUsd: 0 });
+  const t = token({ address: '0xaaa', volume: 0 });
+  const { candidates, rejected } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => [t],
+    infoFetcher: async () => infoAtAge(48),
+    now: NOW,
+  });
+  assert.equal(candidates.length, 0);
+  assert.equal(rejected[0].rejectedReason, 'VOLUME_NON_POSITIVE');
+});
+
+test('F-07: negative volume (corrupt/impossible data) fails closed as VOLUME_NON_POSITIVE — this previously slipped through as a valid finite number', async () => {
+  const cfg = baseConfig({ minCandidateVolumeUsd: 0 });
+  const t = token({ address: '0xaaa', volume: -500 });
+  const { candidates, rejected } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => [t],
+    infoFetcher: async () => infoAtAge(48),
+    now: NOW,
+  });
+  assert.equal(candidates.length, 0);
+  assert.equal(rejected[0].rejectedReason, 'VOLUME_NON_POSITIVE');
+});
+
+test('F-07 C/D: normal positive volume with the floor disabled (default) is never rejected on volume grounds', async () => {
+  const cfg = baseConfig({ minCandidateVolumeUsd: 0 });
+  const t = token({ address: '0xaaa', volume: 1 }); // smallest possible positive volume
+  const { candidates } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => [t],
+    infoFetcher: async () => infoAtAge(48),
+    now: NOW,
+  });
+  assert.equal(candidates.length, 1, 'a positive volume of any size must pass when no operator floor is configured');
+});
+
+test('F-07: an operator-configured MULTI_MIN_CANDIDATE_VOLUME_USD floor rejects below-floor candidates as VOLUME_TOO_LOW', async () => {
+  const cfg = baseConfig({ minCandidateVolumeUsd: 10_000 });
+  const tokens: GmgnTrendingToken[] = [
+    token({ address: '0x01', volume: 9_999 }), // just under the floor
+    token({ address: '0x02', volume: 10_000 }), // exactly at the floor — passes (floor is exclusive-below)
+  ];
+  const { candidates, rejected } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => tokens,
+    infoFetcher: async () => infoAtAge(48),
+    now: NOW,
+  });
+  assert.ok(rejected.some((r) => r.address === '0x01' && r.rejectedReason === 'VOLUME_TOO_LOW'));
+  assert.ok(candidates.some((c) => c.address === '0x02'));
+});
+
+test('F-07: the configured floor never rejects on market cap/age/classification grounds instead — reason codes stay distinct', async () => {
+  const cfg = baseConfig({ minCandidateVolumeUsd: 10_000 });
+  const t = token({ address: '0xaaa', volume: 1, market_cap: 2_000_000 }); // fails volume floor only
+  const { rejected } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => [t],
+    infoFetcher: async () => infoAtAge(48),
+    now: NOW,
+  });
+  assert.equal(rejected[0].rejectedReason, 'VOLUME_TOO_LOW');
+});
+
+test('F-07: deterministic sorting and Top N behavior are unaffected by the new floor when all survivors clear it', async () => {
+  const cfg = baseConfig({ topN: 2, minCandidateVolumeUsd: 100 });
+  const tokens: GmgnTrendingToken[] = [
+    token({ address: '0x01', volume: 100_000 }),
+    token({ address: '0x02', volume: 900_000 }),
+    token({ address: '0x03', volume: 500_000 }),
+  ];
+  const { candidates } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => tokens,
+    infoFetcher: async () => infoAtAge(48),
+    now: NOW,
+  });
+  assert.deepEqual(
+    candidates.map((c) => c.address),
+    ['0x02', '0x03'],
+    'sorting/topN must remain volume-descending and unaffected by an easily-cleared floor',
+  );
+});
+
+test('F-07 K: an extremely large configured minimum deterministically rejects every candidate as VOLUME_TOO_LOW, no crash/overflow/NaN', async () => {
+  const cfg = baseConfig({ minCandidateVolumeUsd: 1_000_000_000_000 });
+  const tokens: GmgnTrendingToken[] = [
+    token({ address: '0x01', volume: 900_000 }),
+    token({ address: '0x02', volume: 50_000_000 }),
+  ];
+  const { candidates, rejected } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => tokens,
+    infoFetcher: async () => infoAtAge(48),
+    now: NOW,
+  });
+  assert.equal(candidates.length, 0);
+  assert.ok(rejected.every((r) => r.rejectedReason === 'VOLUME_TOO_LOW'));
+});
+
+test('F-07 K: a non-finite (Infinity) MULTI_MIN_CANDIDATE_VOLUME_USD is impossible via envNum\'s existing finiteness guard — falls back to the 0 default rather than rejecting everything', async () => {
+  process.env.MULTI_MIN_CANDIDATE_VOLUME_USD = '1e400'; // parses to Infinity
+  try {
+    const { loadMultiConfig } = await import('../src/strategy/multiConfig.js');
+    const cfg = loadMultiConfig(4663);
+    assert.equal(cfg.minCandidateVolumeUsd, 0, 'envNum must fall back to the default, not silently accept Infinity');
+    assert.equal(cfg.enabled, true);
+  } finally {
+    delete process.env.MULTI_MIN_CANDIDATE_VOLUME_USD;
+  }
+});
+
+test('F-07: a very large (implausibly high) volume is not rejected by this fix — no upper bound was added, by design (no defensible threshold exists yet)', async () => {
+  const cfg = baseConfig();
+  const t = token({ address: '0xaaa', volume: 50_000_000_000 });
+  const { candidates } = await fetchAndFilterCandidates(cfg, {
+    fetcher: async () => [t],
+    infoFetcher: async () => infoAtAge(48),
+    now: NOW,
+  });
+  assert.equal(candidates.length, 1);
 });
 
 // ── Filter-before-top10 + volume sorting ─────────────────────────────────

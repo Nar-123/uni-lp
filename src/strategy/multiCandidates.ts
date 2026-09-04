@@ -145,6 +145,20 @@ export async function fetchAndFilterCandidates(
       rejected.push(rejectWith(candidate, 'VOLUME_UNKNOWN'));
       continue;
     }
+    // Phase 4.7 audit (F-07): numberOrNull only screens out non-finite values
+    // (NaN/Infinity) — zero and negative volume are both finite and used to
+    // pass silently. A "trending" candidate reporting zero or negative 6h
+    // volume is not a risk-tolerance judgment call, it is impossible/corrupt
+    // data (never coerced to a valid-but-low number), so this check is
+    // always on regardless of config.minCandidateVolumeUsd.
+    if (candidate.volume6hUsd <= 0) {
+      rejected.push(rejectWith(candidate, 'VOLUME_NON_POSITIVE'));
+      continue;
+    }
+    if (candidate.volume6hUsd < config.minCandidateVolumeUsd) {
+      rejected.push(rejectWith(candidate, 'VOLUME_TOO_LOW'));
+      continue;
+    }
     if (candidate.marketCapUsd == null) {
       rejected.push(rejectWith(candidate, 'MC_UNKNOWN'));
       continue;

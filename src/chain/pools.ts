@@ -9,13 +9,15 @@ import {
 } from '../config.js';
 import { factoryAbi, poolAbi, stateViewAbi } from './abis.js';
 import { getPublicClient } from './clients.js';
+import type { MinimalReadClient } from './quote.js';
 import {
   fetchPairByAddress,
   fetchV3PoolsForToken,
+  getTokenPriceUsd,
   pairDexId,
   type DexPair,
 } from '../price/dexscreener.js';
-import { getTokenMeta, type TokenMeta } from './tokens.js';
+import { getTokenBalance, getTokenMeta, humanToFloat, type TokenMeta } from './tokens.js';
 import {
   listV4PoolsForToken,
   resolveV4PoolKey,
@@ -63,6 +65,23 @@ export type ListedPool = {
 };
 
 const ZERO = '0x0000000000000000000000000000000000000000';
+
+/**
+ * Phase 4.7 audit (F-09) — pure decision logic, split out from
+ * listV3PoolsForToken's RPC call so the security-critical comparison
+ * itself is directly unit-testable. `factoryResult` is whatever
+ * resolvePoolFromFactory(chainId, token0, token1, fee, dex) returned (null
+ * for "no such pool" / zero address); `candidatePoolAddress` is the
+ * address being verified (DexScreener's pairAddress). Only an exact match
+ * verifies the candidate — anything else (null, a different real pool for
+ * that same token/fee pair, a zero address) is untrusted.
+ */
+export function isFactoryVerifiedPool(
+  factoryResult: string | null,
+  candidatePoolAddress: string,
+): boolean {
+  return factoryResult != null && factoryResult.toLowerCase() === candidatePoolAddress.toLowerCase();
+}
 
 export async function listPoolsForToken(
   chainId: SupportedChainId,
@@ -149,6 +168,39 @@ async function listV3PoolsForToken(
       }
 
       const feeNum = Number(fee);
+
+      // Phase 4.7 audit (F-09): DexScreener's pairAddress is untrusted input
+      // — a contract that merely implements token0()/token1()/fee() (trivial
+      // to deploy) would otherwise be accepted purely because it returned
+      // plausible-looking values. The only authoritative source for "is this
+      // THE canonical pool for (token0, token1, fee)" is the chain-specific
+      // v3 factory itself (resolveV3Contracts already selects per-chain,
+      // per-venue — never assumes one chain's factory applies to another).
+      // Any outcome other than an exact address match — mismatch, zero
+      // address, or the factory call itself failing (RPC error, factory not
+      // deployed for this dex on this chain) — fails closed: the candidate
+      // pool is skipped, never silently trusted. This never touches the
+      // separate manual paste-address flow (resolveV3PoolFromAddress),
+      // which has a different, human-in-the-loop trust model.
+      let factoryVerified: Address | null = null;
+      try {
+        factoryVerified = await resolvePoolFromFactory(chainId, token0 as Address, token1 as Address, feeNum, dex);
+      } catch (e) {
+        console.warn(
+          `[pools] factory verification RPC failure for candidate pool ${poolAddress} (${dex}, chain ${chainId}): ` +
+            `${e instanceof Error ? e.message : String(e)} — skipping (fail closed)`,
+        );
+        continue;
+      }
+      if (!isFactoryVerifiedPool(factoryVerified, poolAddress)) {
+        console.warn(
+          `[pools] factory verification failed for candidate pool ${poolAddress} (${dex}, chain ${chainId}, ` +
+            `token0=${token0}, token1=${token1}, fee=${feeNum}): factory returned ${factoryVerified ?? 'null'} — ` +
+            `skipping (fail closed, possible spoofed/incorrect pairAddress from DexScreener)`,
+        );
+        continue;
+      }
+
       const tvlUsd = pair.liquidity?.usd ?? 0;
       const feeLabel = feeNum ? `${(feeNum / 10000).toFixed(2)}%` : '?';
       const venue = dexLabel(dex);
@@ -489,15 +541,160 @@ export async function resolvePoolFromFactory(
   tokenB: Address,
   fee: number,
   dex: DexId = 'uniswap',
+  client: MinimalReadClient = getPublicClient(chainId),
 ): Promise<Address | null> {
-  const client = getPublicClient(chainId);
   const { factory } = resolveV3Contracts(chainId, dex);
-  const pool = await client.readContract({
+  const pool = (await client.readContract({
     address: factory,
     abi: factoryAbi,
     functionName: 'getPool',
     args: [tokenA, tokenB, fee],
-  });
+  })) as Address;
   if (!pool || pool.toLowerCase() === ZERO) return null;
   return pool as Address;
+}
+
+/**
+ * Phase 4.7 audit (F-08) result of independently verifying a V3 pool's
+ * reserves on-chain, rather than trusting DexScreener's `liquidity.usd`
+ * (which can be stale, cached, or — in principle — manufactured by whoever
+ * controls what DexScreener indexes for a brand-new pair).
+ *
+ * `TVL_MISMATCH` intentionally reuses the SAME bar the candidate pool
+ * already had to clear via DexScreener's number (`MIN_POOL_TVL_USD`,
+ * chain.ts's existing hard filter in discoverAndScorePoolsForCandidate) —
+ * this is not a new, separately-invented tolerance/ratio. The claim being
+ * verified is narrow and defensible: "the pool genuinely holds at least as
+ * much real, on-chain, reliably-priced reserves as DexScreener's number
+ * was already required to show" — not "DexScreener's exact figure is
+ * accurate to some percent," which would require picking an arbitrary
+ * tolerance band with no existing anchor in this codebase.
+ */
+export type OnChainReserveCheckResult =
+  | { status: 'OK'; onchainTvlUsd: number }
+  | { status: 'ONCHAIN_VALIDATION_ERROR'; message: string }
+  | { status: 'TVL_MISMATCH'; onchainTvlUsd: number; dexscreenerTvlUsd: number };
+
+/**
+ * Pure decision logic, deliberately separated from the RPC-fetching wrapper
+ * below (same split already used by multiPool.ts's scoreMultiPool/
+ * isValidMetric) so every numeric edge case — matching/diverging TVL,
+ * missing price, NaN/Infinity, zero balances — is unit-testable without any
+ * network access or mocked RPC client.
+ */
+export function classifyOnChainReserves(params: {
+  balA: bigint;
+  decimalsA: number;
+  priceA: number | null;
+  balB: bigint;
+  decimalsB: number;
+  priceB: number | null;
+  dexscreenerTvlUsd: number;
+}): OnChainReserveCheckResult {
+  const { balA, decimalsA, priceA, balB, decimalsB, priceB, dexscreenerTvlUsd } = params;
+
+  if (priceA == null || priceB == null) {
+    return {
+      status: 'ONCHAIN_VALIDATION_ERROR',
+      message: `price unavailable for ${priceA == null ? 'tokenA' : 'tokenB'} — refusing to treat as $0`,
+    };
+  }
+
+  const usdA = humanToFloat(balA, decimalsA) * priceA;
+  const usdB = humanToFloat(balB, decimalsB) * priceB;
+  const onchainTvlUsd = usdA + usdB;
+
+  if (!Number.isFinite(onchainTvlUsd) || onchainTvlUsd < 0) {
+    return {
+      status: 'ONCHAIN_VALIDATION_ERROR',
+      message: `computed on-chain TVL is not a valid finite non-negative number (${onchainTvlUsd})`,
+    };
+  }
+
+  if (onchainTvlUsd < MIN_POOL_TVL_USD) {
+    return { status: 'TVL_MISMATCH', onchainTvlUsd, dexscreenerTvlUsd };
+  }
+
+  return { status: 'OK', onchainTvlUsd };
+}
+
+/**
+ * V3-only. A V3 pool contract itself custodies 100% of both tokens owed to
+ * every LP across every tick range (unlike v4's singleton PoolManager, which
+ * pools funds for many pools together — see verifyV4PoolHasLiquidity in
+ * v4.ts for why this exact technique does not carry over). Reading the
+ * pool's own ERC20 balances is therefore a complete, authoritative on-chain
+ * reserve figure — not `liquidity()` (a virtual, current-tick-only unit) and
+ * not a re-derived sqrtPriceX96/tick computation, both of which the Phase
+ * 4.7 audit explicitly flagged as easy to misuse ("do not invent a TVL
+ * formula", "do not confuse liquidity units... with pool TVL").
+ *
+ * Fails closed (ONCHAIN_VALIDATION_ERROR) on any RPC failure or missing
+ * price for either side — never coerces an unpriceable/unreadable side to
+ * $0, which would silently understate real TVL and could wrongly reject a
+ * genuinely healthy pool, or — worse — silently pass one with a manipulated
+ * price feed reporting near-zero for the "other" side.
+ */
+/** Injectable for tests — mirrors the existing optional-client pattern used elsewhere (e.g. swap.ts's estimateAmountOut) so real-RPC failure paths are unit-testable without live network access. */
+export type OnChainReserveDeps = {
+  getBalance: typeof getTokenBalance;
+  getMeta: typeof getTokenMeta;
+  getPrice: typeof getTokenPriceUsd;
+};
+
+const defaultOnChainReserveDeps: OnChainReserveDeps = {
+  getBalance: getTokenBalance,
+  getMeta: getTokenMeta,
+  getPrice: getTokenPriceUsd,
+};
+
+export async function verifyOnChainPoolReserves(
+  chainId: SupportedChainId,
+  poolAddress: Address,
+  tokenA: Address,
+  tokenB: Address,
+  dexscreenerTvlUsd: number,
+  deps: OnChainReserveDeps = defaultOnChainReserveDeps,
+): Promise<OnChainReserveCheckResult> {
+  let balA: bigint;
+  let balB: bigint;
+  try {
+    [balA, balB] = await Promise.all([
+      deps.getBalance(chainId, tokenA, poolAddress),
+      deps.getBalance(chainId, tokenB, poolAddress),
+    ]);
+  } catch (e) {
+    return {
+      status: 'ONCHAIN_VALIDATION_ERROR',
+      message: `on-chain balance read failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+
+  let metaA: TokenMeta;
+  let metaB: TokenMeta;
+  let priceA: number | null;
+  let priceB: number | null;
+  try {
+    [metaA, metaB, priceA, priceB] = await Promise.all([
+      deps.getMeta(chainId, tokenA),
+      deps.getMeta(chainId, tokenB),
+      deps.getPrice(chainId, tokenA),
+      deps.getPrice(chainId, tokenB),
+    ]);
+  } catch (e) {
+    return {
+      status: 'ONCHAIN_VALIDATION_ERROR',
+      message: `token metadata/price lookup failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+
+  return classifyOnChainReserves({
+    balA,
+    decimalsA: metaA.decimals,
+    priceA,
+    balB,
+    decimalsB: metaB.decimals,
+    priceB,
+    dexscreenerTvlUsd,
+  });
 }
